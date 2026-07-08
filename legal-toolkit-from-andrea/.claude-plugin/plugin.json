@@ -1,0 +1,10 @@
+{
+  "name": "legal-toolkit-from-andrea",
+  "version": "1.0.0",
+  "description": "A growing library of litigation skills: court-filing formatting, PDF-to-text conversion, and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic.",
+  "author": {
+    "name": "Andrea Reed"
+  },
+  "license": "MIT",
+  "keywords": ["legal", "litigation", "court-filing", "docx", "pdf"]
+}

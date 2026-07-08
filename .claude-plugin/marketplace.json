@@ -1,0 +1,14 @@
+{
+  "name": "legal-toolkit-from-andrea",
+  "owner": {
+    "name": "Andrea Reed"
+  },
+  "plugins": [
+    {
+      "name": "legal-toolkit-from-andrea",
+      "displayName": "Legal Toolkit (from Andrea)",
+      "source": "./legal-toolkit-from-andrea",
+      "description": "A growing library of litigation skills: court-filing formatting (Texas state, New York, federal, Texas Business Court, AAA arbitration), PDF-to-text conversion, and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic."
+    }
+  ]
+}
