@@ -12,7 +12,7 @@ particular firm, client, or matter is baked in.
 ## What's inside
 
 The marketplace currently lists one plugin, `legal-toolkit-from-andrea`, with
-three skills:
+seven skills:
 
 - **environment-setup** — the first-run setup. It writes a small local profile
   (your name, bar number, signature block, default jurisdictions, and where your
@@ -22,6 +22,14 @@ three skills:
   Supreme Court, federal, Texas Business Court, and AAA arbitration.
 - **pdf-to-cowork** — converts PDFs into clean Markdown or plain text that Claude
   can fully read and search.
+- **court-filing-normalizer** — batch-renames court filing PDFs (NYSCEF,
+  ECF/PACER, eFileTexas) to a consistent dated, docketed naming convention.
+- **date-checker** — verifies every date in a draft against the real calendar
+  before work goes out the door.
+- **ny-tanbook** — formats New York citations to the Official Reports style
+  manual (the "Tanbook").
+- **title11-bankruptcy** — offline U.S. Bankruptcy Code section lookup, defined
+  terms, and cross-reference tracing.
 
 ## Add the marketplace in Cowork
 
