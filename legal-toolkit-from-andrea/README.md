@@ -25,6 +25,19 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
   into Markdown/plain text the assistant can read and search natively, with a
   content-gap report. Runs entirely in the shell sandbox — no host-OS
   dependency.
+- **court-filing-normalizer** — batch-renames court filing PDFs (NYSCEF,
+  ECF/PACER, eFileTexas) to a consistent `YYYY.MM.DD [docket #] Title.pdf`
+  convention, extracting date, docket number, and title from PDF content, with a
+  confirm-before-rename table and a dry-run mode.
+- **date-checker** — verifies every date in a draft against the real calendar
+  (impossible dates, wrong day-of-week labels, internal inconsistencies,
+  today/tomorrow mismatches) before work goes out the door.
+- **ny-tanbook** — formats and converts New York citations to the NY Law Reports
+  Style Manual (the "Tanbook", 2022 ed.), with a bundled rule distillation and a
+  citation self-test engine.
+- **title11-bankruptcy** — offline U.S. Bankruptcy Code lookup: pull a section's
+  operative text, resolve defined terms to their defining section, and trace
+  cross-references (bundled public-domain corpus, 280 sections).
 
 ## First run
 
@@ -34,6 +47,10 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
 3. For California filings, follow the one-time setup in
    `skills/court-filing/modules/STATE-CA.md` to derive CA format from your own
    sample pleadings.
+
+date-checker, ny-tanbook, and title11-bankruptcy need no setup at all.
+court-filing-normalizer optionally reads `matter_root` from the shared profile
+to sanity-check target folders.
 
 ## Design principles
 
