@@ -38,6 +38,20 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
 - **title11-bankruptcy** — offline U.S. Bankruptcy Code lookup: pull a section's
   operative text, resolve defined terms to their defining section, and trace
   cross-references (bundled public-domain corpus, 280 sections).
+- **caselaw-retriever** — searches CourtListener (keyword + semantic) and free
+  legal databases, retrieves full opinion text through a source hierarchy,
+  checks the citation graph, and emits structured JSON for the analyst skill.
+  Needs a free CourtListener API token (see First run).
+- **caselaw-analyst** — produces formatted Word deliverables (research memos,
+  cite-check reports, case summaries) from the retriever's structured output,
+  using your profile's identity and font settings.
+- **cite-check** — the full verification pipeline for briefs: eyecite citation
+  detection, batched CourtListener resolution with identity gates, a bounded
+  free-source gap loop, Isaacus AI proposition verification, quote-fidelity
+  grading, good-law treatment signals, and a five-tier severity report (HTML,
+  .docx, or .txt). Needs CourtListener + Isaacus API keys (see First run).
+  The author's regression fixtures (built from real briefs) are not included;
+  validate changes against a brief you know.
 
 ## First run
 
@@ -51,6 +65,13 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
 date-checker, ny-tanbook, and title11-bankruptcy need no setup at all.
 court-filing-normalizer optionally reads `matter_root` from the shared profile
 to sanity-check target folders.
+
+The research skills need API keys: **caselaw-retriever** a free CourtListener
+token, **cite-check** a CourtListener token plus an Isaacus key. Add them via
+environment-setup (they live under `api_keys` in the profile), or set the
+`COURTLISTENER_API_TOKEN` / `ISAACUS_API_KEY` environment variables, or drop a
+`CL_CONFIG.txt` / `ISAACUS_CONFIG.txt` next to the skill's scripts. Never
+commit or share these keys.
 
 ## Design principles
 

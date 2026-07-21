@@ -12,7 +12,7 @@ particular firm, client, or matter is baked in.
 ## What's inside
 
 The marketplace currently lists one plugin, `legal-toolkit-from-andrea`, with
-seven skills:
+ten skills:
 
 - **environment-setup** — the first-run setup. It writes a small local profile
   (your name, bar number, signature block, default jurisdictions, and where your
@@ -30,6 +30,13 @@ seven skills:
   manual (the "Tanbook").
 - **title11-bankruptcy** — offline U.S. Bankruptcy Code section lookup, defined
   terms, and cross-reference tracing.
+- **caselaw-retriever** — finds and retrieves court opinions from CourtListener
+  and free legal databases, with citation-graph checks and structured output.
+- **caselaw-analyst** — turns retrieved case data into formatted Word research
+  memos, cite-check reports, and case summaries.
+- **cite-check** — verifies every citation in a brief against its source
+  opinion: eyecite detection, CourtListener resolution, and Isaacus AI
+  proposition verification, with a defect-severity report.
 
 ## Add the marketplace in Cowork
 

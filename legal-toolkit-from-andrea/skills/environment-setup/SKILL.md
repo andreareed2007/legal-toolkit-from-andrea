@@ -10,7 +10,7 @@ description: >
   setting later without redoing the whole interview.
 ---
 
-> **Version:** v1.0.0 · First-run bootstrap for the legal-filing-toolkit.
+> **Version:** v1.1.0 · First-run bootstrap for the legal-filing-toolkit.
 
 # Environment Setup — Toolkit Bootstrap
 
@@ -72,6 +72,14 @@ single setting gets only that question. Group related questions. Cover:
    Schoolbook and Times New Roman as common options; let them type their own).
 7. **Home jurisdiction(s)** — which courts they file in most (e.g. CA-STATE,
    FEDERAL, NY-STATE, TX-STATE). This drives which court-filing modules matter.
+8. **Research API keys (optional — only if they will use caselaw-retriever or
+   cite-check)** — a free CourtListener API token
+   (https://www.courtlistener.com → account → API), and an Isaacus API key
+   (https://isaacus.com) for AI proposition verification in cite-check. Either
+   can be skipped and added later; the skills also accept the
+   `COURTLISTENER_API_TOKEN` / `ISAACUS_API_KEY` environment variables.
+9. **Case index (optional)** — if they want caselaw-retriever to keep a running
+   spreadsheet of every case it retrieves, the path for that .xlsx.
 
 ## Step 3 — Write the profile
 
@@ -96,7 +104,9 @@ Assemble answers into a JSON object matching this shape and write it:
   },
   "filing_font": "Century Schoolbook",
   "default_signer": "Jane Q. Public",
-  "jurisdictions": ["CA-STATE"]
+  "jurisdictions": ["CA-STATE"],
+  "api_keys": {"courtlistener": "", "isaacus": ""},
+  "case_index_path": ""
 }
 ```
 

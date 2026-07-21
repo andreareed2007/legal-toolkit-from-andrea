@@ -36,6 +36,11 @@ DEFAULTS = {
     "bar_label": "State Bar No.",
     "default_signer": "",
     "jurisdictions": [],
+    "api_keys": {          # research skills (caselaw-retriever, cite-check)
+        "courtlistener": "",
+        "isaacus": "",
+    },
+    "case_index_path": "",  # optional running index xlsx (caselaw-retriever)
 }
 
 
