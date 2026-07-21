@@ -12,7 +12,7 @@ particular firm, client, or matter is baked in.
 ## What's inside
 
 The marketplace currently lists one plugin, `legal-toolkit-from-andrea`, with
-ten skills:
+eleven skills:
 
 - **environment-setup** — the first-run setup. It writes a small local profile
   (your name, bar number, signature block, default jurisdictions, and where your
@@ -37,6 +37,12 @@ ten skills:
 - **cite-check** — verifies every citation in a brief against its source
   opinion: eyecite detection, CourtListener resolution, and Isaacus AI
   proposition verification, with a defect-severity report.
+- **jury-charge** — drafts, edits, and audits jury charges from pattern jury
+  instructions. No instruction is drafted unless its verbatim published text was
+  printed in-session, and every routing instruction is machine-generated from a
+  charge-map graph and cross-checked against the final text. Ships with no
+  pattern libraries — you build each jurisdiction's from your own licensed or
+  official copy through a gated, spot-checked builder.
 
 ## Add the marketplace in Cowork
 

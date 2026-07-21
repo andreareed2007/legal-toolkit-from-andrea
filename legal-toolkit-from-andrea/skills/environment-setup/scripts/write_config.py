@@ -44,6 +44,7 @@ def main():
     print("attorneys: " + str([a.get("name") for a in merged.get("attorneys", [])]))
     print("filing_font: " + str(merged.get("filing_font", "")))
     print("jurisdictions: " + str(merged.get("jurisdictions", [])))
+    print("jury_library_root: " + str(merged.get("jury_library_root", "")))
     return 0
 
 
