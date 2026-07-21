@@ -41,6 +41,7 @@ DEFAULTS = {
         "isaacus": "",
     },
     "case_index_path": "",  # optional running index xlsx (caselaw-retriever)
+    "jury_library_root": "~/.legal-skills/jury-instruction-libraries/",  # jury-charge pattern-instruction libraries + registry
 }
 
 

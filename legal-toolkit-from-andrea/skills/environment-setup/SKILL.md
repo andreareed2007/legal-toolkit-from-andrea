@@ -80,6 +80,12 @@ single setting gets only that question. Group related questions. Cover:
    `COURTLISTENER_API_TOKEN` / `ISAACUS_API_KEY` environment variables.
 9. **Case index (optional)** — if they want caselaw-retriever to keep a running
    spreadsheet of every case it retrieves, the path for that .xlsx.
+10. **Jury instruction libraries (optional — only if they will use jury-charge)**
+   — the root folder where jury-charge stores each jurisdiction's
+   pattern-instruction library and the `libraries.json` registry. Defaults to
+   `~/.legal-skills/jury-instruction-libraries/`; accept the default unless they
+   keep these files elsewhere. The skill ships with no libraries — each is built
+   and validated on demand through the jury-charge library builder.
 
 ## Step 3 — Write the profile
 
@@ -106,7 +112,8 @@ Assemble answers into a JSON object matching this shape and write it:
   "default_signer": "Jane Q. Public",
   "jurisdictions": ["CA-STATE"],
   "api_keys": {"courtlistener": "", "isaacus": ""},
-  "case_index_path": ""
+  "case_index_path": "",
+  "jury_library_root": "~/.legal-skills/jury-instruction-libraries/"
 }
 ```
 

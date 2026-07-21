@@ -52,6 +52,15 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
   .docx, or .txt). Needs CourtListener + Isaacus API keys (see First run).
   The author's regression fixtures (built from real briefs) are not included;
   validate changes against a brief you know.
+- **jury-charge** — drafts, edits, and audits jury charges from pattern jury
+  instructions with two hard guarantees: no instruction is drafted unless its
+  verbatim published text was printed in-session (no language from memory), and
+  every "If you answered..." routing instruction is machine-generated from a
+  charge-map graph and cross-checked against the final text. Ships with **no
+  pattern libraries** — you build each jurisdiction's library (Texas PJC,
+  California CACI, federal circuit patterns, ...) from your own licensed or
+  official copy through a gated, spot-checked builder. Assembles the filing-ready
+  .docx through **court-filing** and emits an HTML routing audit.
 
 ## First run
 
@@ -65,6 +74,12 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
 date-checker, ny-tanbook, and title11-bankruptcy need no setup at all.
 court-filing-normalizer optionally reads `matter_root` from the shared profile
 to sanity-check target folders.
+
+**jury-charge** ships with no pattern-instruction libraries. The first time you
+use it for a jurisdiction, it walks you through staging and validating your own
+copy of the governing pattern instructions; the libraries and their registry
+live under `jury_library_root` (default
+`~/.legal-skills/jury-instruction-libraries/`, set in environment-setup).
 
 The research skills need API keys: **caselaw-retriever** a free CourtListener
 token, **cite-check** a CourtListener token plus an Isaacus key. Add them via
