@@ -1,7 +1,7 @@
 {
   "name": "legal-toolkit-from-andrea",
-  "version": "1.1.0",
-  "description": "A growing library of litigation skills: court-filing formatting, PDF-to-text conversion, court-filing PDF renaming, calendar-true date checking, NY Tanbook citation formatting, offline Bankruptcy Code lookup, and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic.",
+  "version": "1.2.0",
+  "description": "A growing library of litigation skills: court-filing formatting, PDF-to-text conversion, court-filing PDF renaming, calendar-true date checking, NY Tanbook citation formatting, offline Bankruptcy Code lookup, case-law research and memo drafting (CourtListener), a full AI cite-check pipeline (eyecite + CourtListener + Isaacus), and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic.",
   "author": {
     "name": "Andrea Reed"
   },
@@ -14,6 +14,9 @@
     "pdf",
     "citations",
     "bankruptcy",
-    "dates"
+    "dates",
+    "caselaw",
+    "cite-check",
+    "courtlistener"
   ]
 }

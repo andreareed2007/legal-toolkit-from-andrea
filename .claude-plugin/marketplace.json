@@ -8,7 +8,7 @@
       "name": "legal-toolkit-from-andrea",
       "displayName": "Legal Toolkit (from Andrea)",
       "source": "./legal-toolkit-from-andrea",
-      "description": "A growing library of litigation skills: court-filing formatting (Texas state, New York, federal, Texas Business Court, AAA arbitration), PDF-to-text conversion, court-filing PDF renaming, calendar-true date checking, NY Tanbook citation formatting, offline Bankruptcy Code lookup, and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic."
+      "description": "A growing library of litigation skills: court-filing formatting (Texas state, New York, federal, Texas Business Court, AAA arbitration), PDF-to-text conversion, court-filing PDF renaming, calendar-true date checking, NY Tanbook citation formatting, offline Bankruptcy Code lookup, case-law research and memo drafting (CourtListener), a full AI cite-check pipeline (eyecite + CourtListener + Isaacus), and a shared first-run setup that tailors every skill to your machine, identity, and jurisdictions. Identity-, DMS-, and jurisdiction-agnostic."
     }
   ]
 }
