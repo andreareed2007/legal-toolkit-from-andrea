@@ -64,7 +64,7 @@ pip install --break-system-packages \
   "eyecite==2.7.8"
 ```
 
-**eyecite pinned 2026.07.03, HARD pin 2026.07.19:** validated against eyecite 2.7.8 (parses NY Slip Op (U) forms natively on the Gold-Set-A fixture). Citation detection backbone as of the July 2026 rebuild. The pin is exact (==2.7.8): the old floating install would silently adopt a future eyecite release with no gate run. Upgrade deliberately — bump the pin, then run pytest + all six gates before any real brief.
+**eyecite pinned 2026.07.03, HARD pin 2026.07.19:** validated against eyecite 2.7.8 (parses NY Slip Op (U) forms natively on the Brief A fixture). Citation detection backbone as of the July 2026 rebuild. The pin is exact (==2.7.8): the old floating install would silently adopt a future eyecite release with no gate run. Upgrade deliberately — bump the pin, then run pytest + all six gates before any real brief.
 
 ### Runner state directory (2026.07.04)
 
@@ -105,7 +105,7 @@ not resolvable from the script's temp dir).
 
 The SDK never receives a bare API key argument in this project.  All six
 Python modules resolve credentials via `isaacus_config.get_client()`, which
-reads the key in this order:
+resolves the key in this order:
 
 ```
 1. ISAACUS_API_KEY environment variable
@@ -113,11 +113,12 @@ reads the key in this order:
 3. ISAACUS_CONFIG.txt next to the scripts (one line, bare key)
 ```
 
-Key files are **not** tracked in git and are **not** read by any shell
+That file is **not** tracked in git and is **not** readable by any shell
 command in this project.  The only allowed read path is
-`Path.read_text()` inside `isaacus_config.py`.
+`Path.read_text()` inside `isaacus_config.py`.  See the global CLAUDE.md
+credential discipline section for the enforcement rationale.
 
-If no key is found anywhere, `isaacus_config.py` raises
+If `ISAACUS_CONFIG.txt` is missing, `isaacus_config.py` raises
 `IsaacusConfigError` with a path-only message (never file contents).
 
 ---
@@ -196,7 +197,7 @@ a client but does not make any billable calls.
 
 ## 6. Cost ceiling (from plan v3, section 7)
 
-- Cite-check pipeline baseline: **$25-$90 per month** for the author's
+- Cite-check pipeline baseline: **$25-$90 per month** for the attorney's
   expected usage (several cite-checks per week, occasional long briefs
   that trigger AI chunking).
 - AI chunking (`isaacus_chunker.chunk_if_needed` with the AI branch
@@ -210,16 +211,15 @@ a client but does not make any billable calls.
 
 ## 7. Sequence for a clean install
 
-1. Install the cite-check skill (the scripts ship inside it).
-2. Provide the Isaacus key: run the environment-setup skill (writes
-   `api_keys.isaacus` to `~/.legal-skills/config.json`), or set
-   `ISAACUS_API_KEY`, or place `ISAACUS_CONFIG.txt` next to the scripts
-   (one line, bare API key, no prefix).
+1. Install this skill (the bundled `scripts/` folder is the authoritative
+   copy for this edition).
+2. Provide the Isaacus key: set `ISAACUS_API_KEY`, add `api_keys.isaacus`
+   via the environment-setup skill, or place `ISAACUS_CONFIG.txt` next to
+   the scripts (one line, bare API key, no prefix).
 3. Run the install command from section 2.
 4. Run the verification sequence from section 5.
 5. On success, the cite-check pipeline is ready.  Validate any code change
-   against a brief you know well before a live run (the author's regression
-   gates and gold sets are not distributed).
+   with `cc_prop_gate.py` (regression gate) + `tests/` before a live run.
    (`cite_check_quality_check.py` is retired to `_Archive/` as of 2026.07.04.)
 
 ---

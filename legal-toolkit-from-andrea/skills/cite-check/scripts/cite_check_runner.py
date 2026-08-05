@@ -67,7 +67,7 @@ _HEADING_GLUE_RE = __import__("re").compile(
 
 def _heading_glue(prop):
     """Phase 5 polish (2026.07.04): SUSPECT heuristic for a Title Case section
-    heading glued onto the sentence start (the Gold-Set-A Alliance Network miss:
+    heading glued onto the sentence start (the Brief A Alliance Network miss:
     'The Fourteenth and Fifteenth Amendments Given the ongoing...').  A prefix
     of 3-10 capitalized/connector words with NO sentence punctuation, followed
     by a fresh capitalized sentence opener, is heading-shaped.  False positives
@@ -136,10 +136,10 @@ def build():
     brief_path = sys.argv[2]
     matter = sys.argv[3] if len(sys.argv) > 3 else ""
     doc_name = sys.argv[4] if len(sys.argv) > 4 else os.path.basename(brief_path)
-    # .docx/.dotx intake (2026.07.13, QA-Brief magic-wand miss): reading a Word
+    # .docx/.dotx intake (2026.07.13, Brief C magic-wand miss): reading a Word
     # file as UTF-8 text throws, and a naive python-docx paragraph extract
     # SILENTLY DROPS every footnote marker and footnote body -- so footnoted
-    # citations never enter the pipeline (the QA-Brief Opposition footnote
+    # citations never enter the pipeline (the Brief C Opposition footnote
     # authorities, incl. the fabricated "magic wand" quote cited in fn.15 as
     # "Id. at 704", were all missed). Route Word files through docx_to_text,
     # which splices each footnote inline at its reference marker so a footnoted
@@ -149,12 +149,16 @@ def build():
         bt = docx_to_text.extract(brief_path)
     else:
         bt = open(brief_path, encoding="utf-8").read()
-    built = build_citations(bt)
+    try:
+        built = build_citations(bt)
+    except cc.DoubledInputError as e:
+        print(f"[build] REFUSED -- {e}", file=sys.stderr)
+        sys.exit(2)
     # A new build starts a NEW job: clear downstream state from any prior
     # document (2026.07.04 Session 3). The resolve/ckpt maps are keyed by
     # citation INDEX, so stale state from another brief silently feeds the
     # WRONG opinion text to same-numbered citations (observed live: a
-    # Gold-Set-A cite inherited a Gold-Set-B search trail). Resolve resumability
+    # Brief A cite inherited a Brief B search trail). Resolve resumability
     # within ONE job is unaffected -- resolve windows never re-run build.
     for _p in (RES_PKL, CKPT, RESULT_PKL, GAPS_JSON, GOODLAW_PKL, VERIFY_JSON):
         if os.path.exists(_p):
@@ -260,7 +264,7 @@ def resolve():
         # Phase 7 (2026.07.15): the resolver now records the untrimmed body
         # on the log at EVERY success path -- deterministic, unlike the old
         # post-hoc cache probe, which missed when the lookup ingest cached
-        # under CL's caption instead of the brief's (Farmers, QA-Brief cit 7).
+        # under CL's caption instead of the brief's (Farmers, Brief C cit 7).
         full = None
         if txt:
             full = (getattr(log, "full_text", None)
@@ -356,19 +360,19 @@ def resolve():
 # Step 6.6 (2026.07.10): auto-resolved verification loop (must-verify gate).
 # Cites that DID resolve but resolved to something untrustworthy -- a wrong CL
 # record, or a non-reporter free/slip-op copy -- used to pass silently through
-# phase2 and land as an adverse verdict.  The Gold-Set-A Doc 89 run (2026.07.09)
+# phase2 and land as an adverse verdict.  The Brief A Doc 89 run (2026.07.09)
 # shipped THREE false-negative slip-op verdicts that way (M.A., Bd. of Mgrs.
 # of 252 Condominium, Wolf); a human caught them only post-delivery.  This
 # mirrors the gap-loop manifest pattern: phase2 writes cc_verify_review.json,
 # the agent works each open entry (fetch the actual opinion, read the cited
 # pincite), the `verify` verb ingests findings, and render() HARD-BLOCKS on
-# open entries (author-approved 2026.07.10).  Additive provenance layer:
+# open entries (attorney-approved 2026.07.10).  Additive provenance layer:
 # verify() semantics and the 11-verdict taxonomy are UNTOUCHED.
 # --------------------------------------------------------------------------
 _NY_SLIP_U_RE = re.compile(r"N\.?\s*Y\.?\s*Slip\s*Op\.?\s*\d{4,6}\s*\(\s*[Uu]\s*\)")
 _VERIFY_ADVERSE = ("does_not_support", "cited_as_contrary",
                    "identity_unconfirmed", "pincite_not_found")
-# Tunable (author 2026.07.10): low-confidence Somewhat Supports on high-risk
+# Tunable (the attorney 2026.07.10): low-confidence Somewhat Supports on high-risk
 # sources also enter the manifest.  NOTE: with the current verdict thresholds
 # a "somewhat" card carries score > 0.5 by construction, so 0.35 keeps this
 # leg dormant; raise it (e.g. 0.60) to sweep the weakest somewhat band.
@@ -421,7 +425,7 @@ def _verify_trigger(r):
         if hi:
             reason += "; " + "; ".join(hr)
         return True, v, reason
-    # Phase 7 confirmation gate (author 2026.07.15): an unconfirmed
+    # Phase 7 confirmation gate (the attorney 2026.07.15): an unconfirmed
     # FABRICATED (quote missing from a partial copy; complete opinion
     # unavailable) renders review, NOT critical -- and must enter the
     # must-verify loop so the agent fetches the full opinion and settles
@@ -437,6 +441,26 @@ def _verify_trigger(r):
             "unavailable (Phase 7 confirmation gate). Fetch the full "
             "opinion and check the quotation."
             % (_uf[0].get("quote", "") or "")[:80])
+    # 2026.08.04 (v16 Cit 24, In re H-Corp 111 F.4th): a CONFIRMED
+    # fabrication is only as trustworthy as the copy's IDENTITY. When the
+    # resolution was NOT an exact citation-lookup hit (lookup_status 200),
+    # the "complete opinion" the absence was confirmed against may be a
+    # same-name DIFFERENT opinion -- the v16 run confirmed absence against
+    # the 2022 N-Corp v. H-Corp opinion while the quoted words sit
+    # verbatim in the real 2024 111 F.4th opinion (address unindexed on
+    # CL, name-tier win). Enqueue so the agent fetches the ACTUAL cited
+    # opinion before a CRITICAL ships.
+    _cf = [q for q in (getattr(r, "quote_results", None) or [])
+           if q.get("result") == "FABRICATED"
+           and q.get("confirmed", q.get("full_text_checked"))]
+    if _cf and getattr(r, "lookup_status", None) != 200:
+        return True, v, (
+            "confirmed-fabricated quotation (\u201c%s\u2026\u201d) on a "
+            "copy resolved WITHOUT an exact citation-lookup address match "
+            "-- the complete copy may be a same-name different opinion. "
+            "Fetch the cited opinion and check the quotation before the "
+            "Critical stands."
+            % (_cf[0].get("quote", "") or "")[:80])
     if v in _VERIFY_ADVERSE:
         v_reason = "adverse verdict (%s)" % v
     elif v == "somewhat" and r.score < VERIFY_SOMEWHAT_MAX_CONF:
@@ -555,6 +579,7 @@ def phase2():
     # authority's URL) + untrimmed opinion texts for the quote-fidelity pass.
     ou = _propagate_opinion_urls(cits, ck.get("opinion_url", {}))
     ft = ck.get("full_texts", {})
+    ftc = ck.get("full_text_complete", {})
     toa_index = built["toa_index"]
     client = helpers.get_client()
 
@@ -577,7 +602,8 @@ def phase2():
             nc_ok=nc_map.get(i), search_url=su.get(i, ""),
             search_detail=sd.get(i, ""),
             lookup_status=ls_map.get(i), lookup_note=ln_map.get(i, "") or "",
-            full_text=ft.get(_ft_key(c, i)))
+            full_text=ft.get(_ft_key(c, i)),
+            full_text_complete=ftc.get(_ft_key(c, i)))
         return i, r
 
     rmap = {}
@@ -602,7 +628,7 @@ def phase2():
 def patch_gap():
     """Ingest agent-fetched opinion text for one gap-manifest entry.
 
-    USAGE: python3 cite_check_runner.py patch_gap <index> <fetched_text_file> <url> [source]
+    USAGE: python3 cite_check_runner.py patch_gap <index> <fetched_text_file> <url> [source] [note]
     Gated by _looks_like_opinion + _name_or_cite_match (Phase 2b contract);
     bounded at max_fetches attempts per gap.  On success the checkpoint is
     updated in place -- re-run `phase2` (then `render`) to fold it in.
@@ -611,6 +637,10 @@ def patch_gap():
     text_path = sys.argv[3]
     url = sys.argv[4] if len(sys.argv) > 4 else ""
     source = sys.argv[5] if len(sys.argv) > 5 else _clr._source_for_url(url)
+    # Session E (2026.07.29): optional provenance note rendered on the card
+    # (e.g., SCOTX decision date / parallel cite backfilled from the official
+    # court site).
+    note = sys.argv[6] if len(sys.argv) > 6 else ""
 
     ck = pickle.load(open(CKPT, "rb"))
     cits = ck["built"]["citations"]
@@ -641,6 +671,12 @@ def patch_gap():
         reasons.append("does not look like an opinion (too short / no opinion vocabulary)")
     if not _clr._name_or_cite_match(c, body):
         reasons.append("failed the name-or-cite identity gate")
+    if _clr._looks_like_case_search_page(body):
+        # Session E: the docket-number identity branch would accept a
+        # txcourts case-search CASE page (it prints the docket); reject it.
+        reasons.append("looks like a txcourts case-search CASE page, not an "
+                       "opinion -- follow its opinion media link and patch "
+                       "that document instead")
     if reasons:
         if entry["attempts"] >= entry.get("max_fetches", 2):
             entry["status"] = "exhausted"
@@ -660,9 +696,16 @@ def patch_gap():
     rs[idx] = source
     ck.setdefault("opinion_url", {})[idx] = url
     ck.setdefault("full_texts", {})[_ft_key(c, idx)] = body
+    # Fix 8 (Finding 1): record whether this stored copy plausibly runs to
+    # the END of the opinion, at patch time. verify_citation uses this
+    # attestation -- NOT a length comparison -- to decide whether a "quote
+    # absent" result may be CONFIRMED (CRITICAL) or must degrade to review.
+    ck.setdefault("full_text_complete", {})[_ft_key(c, idx)] = cc._opinion_is_complete(body)
     nc[idx] = True  # passed the identity gate on the full fetched body
     sd[idx] = (sd.get(idx, "") + " Patched from free source via gap manifest "
                f"({source}).").strip()
+    if note:
+        sd[idx] = (sd[idx] + " " + note).strip()
     pickle.dump(ck, open(CKPT, "wb"))
     # keep RES_PKL in sync so a later resolve re-run does not re-open the gap
     if os.path.exists(RES_PKL):
@@ -672,6 +715,7 @@ def patch_gap():
         rp.setdefault("recap_src", {})[idx] = source
         rp.setdefault("opinion_url", {})[idx] = url
         rp.setdefault("full_texts", {})[_ft_key(c, idx)] = body
+        rp.setdefault("full_text_complete", {})[_ft_key(c, idx)] = cc._opinion_is_complete(body)
         rp.setdefault("nc_map", {})[idx] = True
         pickle.dump(rp, open(RES_PKL, "wb"))
     entry["status"] = "patched"
@@ -679,6 +723,52 @@ def patch_gap():
     entry["source"] = source
     json.dump(manifest, open(GAPS_JSON, "w", encoding="utf-8"), indent=1)
     print(f"[patch_gap] #{idx} PATCHED via {source} ({len(trimmed)} chars) -- re-run phase2")
+
+
+def statutes():
+    """I3 (2026.07.29): list statute-quote check targets.
+
+    USAGE: python3 cite_check_runner.py statutes
+    Writes cc_statutes.json: citations whose proposition both quotes text and
+    cites a Texas code section, with candidate statute URLs.  The agent
+    fetches the CURRENT section text and ingests via `statute_check`.
+    """
+    ck = pickle.load(open(CKPT, "rb"))
+    cits = ck["built"]["citations"]
+    targets = cc.statute_quote_targets(
+        cits, ck.get("built", {}).get("argument_text") or "")
+    out = os.path.join(_STATE_DIR, "cc_statutes.json")
+    json.dump({"doc_name": ck.get("doc_name", ""), "targets": targets},
+              open(out, "w", encoding="utf-8"), indent=1)
+    print(f"[statutes] {len(targets)} target(s) -> {out}")
+
+
+def statute_check():
+    """I3 (2026.07.29): check quoted statutory text against a fetched section.
+
+    USAGE: python3 cite_check_runner.py statute_check <index> <statute_textfile> [url]
+    Appends a STATUTE CHECK note to the card's search detail (rendered on the
+    report); NEVER changes a verdict.  Re-run `phase2` (then `render`) to fold
+    the note in.
+    """
+    idx = int(sys.argv[2])
+    path = sys.argv[3]
+    url = sys.argv[4] if len(sys.argv) > 4 else ""
+    ck = pickle.load(open(CKPT, "rb"))
+    cits = ck["built"]["citations"]
+    text = open(path, encoding="utf-8", errors="replace").read()
+    note = cc.statute_check_note(cits[idx], text, url)
+    if not note:
+        print(f"[statute_check] #{idx}: no quoted statutory text to check")
+        return
+    sd = ck["search_details"]
+    sd[idx] = ((sd.get(idx, "") + " ") if sd.get(idx) else "") + note
+    pickle.dump(ck, open(CKPT, "wb"))
+    if os.path.exists(RES_PKL):
+        rp = pickle.load(open(RES_PKL, "rb"))
+        rp.setdefault("search_details", {})[idx] = sd[idx]
+        pickle.dump(rp, open(RES_PKL, "wb"))
+    print(f"[statute_check] #{idx}: {note}")
 
 
 def props():
@@ -780,7 +870,7 @@ def verify():
         note = (a.get("note") or "").strip()
         url = (a.get("url") or "").strip()
         quote = (a.get("quote") or "").strip()
-        # Evidence-gated override (author-approved 2026.07.10).
+        # Evidence-gated override (attorney-approved 2026.07.10).
         override = False
         if finding == "confirmed_supports" and a.get("text_file"):
             raw = open(a["text_file"], encoding="utf-8", errors="replace").read()
@@ -816,7 +906,7 @@ def verify():
 
 
 def goodlaw():
-    # Treatment-signal pass (2026.07.06, author-approved design). Runs AFTER
+    # Treatment-signal pass (2026.07.06, attorney-approved design). Runs AFTER
     # phase2. Additive: own state file, own module -- verify()/verdicts
     # untouched. Resumable: re-run until it prints "treatment: done".
     t0 = time.time()
@@ -844,7 +934,7 @@ def render():
     import cite_check_report as rep
     out_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/citecheck_final.html"
     ck = pickle.load(open(RESULT_PKL, "rb")); result = ck["result"]
-    # Step 6.6 HARD GATE (author 2026.07.10, gap-loop precedent): render
+    # Step 6.6 HARD GATE (the attorney 2026.07.10, gap-loop precedent): render
     # refuses while must-verify entries are open.  Work the loop, ingest via
     # the `verify` verb, then re-run render.
     if os.path.exists(VERIFY_JSON):
@@ -872,6 +962,11 @@ def render():
         _st = gl.load_state()
         if _st and _st.get("doc_name") == ck.get("doc_name"):
             meta["treatment"] = gl.summary(_st)
+    # Application-sentence build (2026.08.04): re-run the detector +
+    # verified-sibling cross-check at render time so Step 6.6 overrides
+    # ingested since phase2 update sibling status (idempotent).
+    import cc_application as ccapp
+    ccapp.attach(result["citations"], result.get("application_roster"))
     html = rep.render_html(result["citations"], meta)
     open(out_path, "w", encoding="utf-8").write(html)
     print(f"[render] {len(html)} bytes -> {out_path}")
@@ -880,7 +975,7 @@ def render():
 if __name__ == "__main__":
     _CMDS = {"build": build, "resolve": resolve, "phase2": phase2, "render": render,
              "patch_gap": patch_gap, "props": props, "goodlaw": goodlaw,
-             "verify": verify}
+             "verify": verify, "statutes": statutes, "statute_check": statute_check}
     if len(sys.argv) < 2 or sys.argv[1] not in _CMDS:
         print("usage: cite_check_runner.py {%s} [args]" % "|".join(_CMDS),
               file=sys.stderr)

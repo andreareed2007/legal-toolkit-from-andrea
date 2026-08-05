@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Consolidated, reporter-agnostic proposition extractor for the cite-check
 pipeline.  Replaces cc_proposition_v3 (general but reporter-list-based) and
-cc_proposition_v4 (Gold-Set-A/NY-hardcoded).  NO case names or reporter names are
+cc_proposition_v4 (Brief A/NY-hardcoded).  NO case names or reporter names are
 hardcoded; citations are recognized by STRUCTURE (volume-reporter-page,
 year-WL/LEXIS, court-year parentheticals, Bluebook signals, record cites).
 
@@ -21,7 +21,14 @@ from typing import List, Optional, Tuple, Dict
 # Normalization
 # --------------------------------------------------------------------------
 _SMART = {"“": '"', "”": '"', "‘": "'", "’": "'",
-          "–": "-", "—": "-", "…": " ", " ": " "}
+          # Defect C fix (2026.08.03): "…" is NOT folded to a space. A brief's
+          # interior ellipsis must survive into the extracted proposition so
+          # cc_quote_matcher's unbounded-gap logic (_SEG_TOKEN_RE) engages;
+          # folding it away concatenated elided fragments into one contiguous
+          # needle (Crockett false "approximate match"). _fold stays
+          # length-preserving (1 char -> 1 char), so "…" maps to itself by
+          # omission here -- never expand it to "...".
+          "–": "-", "—": "-", " ": " "}
 
 def _fold(s: str) -> str:
     for k, v in _SMART.items():
@@ -355,7 +362,7 @@ def _is_citation_sentence(raw: str, masked_sent: Optional[str] = None) -> bool:
     BEFORE counting -- a string cite whose statute member carries a quoted
     parenthetical ('...; CPLR 3014 ("A copy of any writing ... for all
     purposes.")') otherwise reads as substantive and ships the citation
-    sentence as the proposition (the Gold-Set-A Alliance occ-2 card).  A
+    sentence as the proposition (the Brief A Alliance occ-2 card).  A
     substantive parenthetical that belongs to THIS cite is still honored
     by the dedicated _parenthetical_after branch; sentence-level substance
     must live OUTSIDE the parentheses."""
@@ -416,7 +423,7 @@ def find_footnotes(text: str) -> List[Dict]:
     spliced into the body stream by the PDF converter, so the old
     next-footnote-only rule swallowed ALL body text that followed a
     footnote -- every later citation in the brief then "lived in" the
-    footnote and inherited its lead sentence (observed live on Gold-Set-A:
+    footnote and inherited its lead sentence (observed live on Brief A:
     FN 2's block claimed citations 0-21).  Footnotes in these briefs are
     single paragraphs; a multi-paragraph footnote ends early, which only
     sends the cite to the ordinary body extractor -- safe.
@@ -545,7 +552,8 @@ def _footnote_prop(text, foot, name, pos=None) -> Dict:
             "needs_attention": na, "reason": "bare footnote" if na else ""}
 
 def extract(text: str, pos: int, name: str = "", foots=None,
-            signal: str = "", masked: Optional[str] = None) -> Dict:
+            signal: str = "", masked: Optional[str] = None,
+            is_id: bool = False) -> Dict:
     if masked is None:
         masked = mask_citations(text)
     if foots is None:
@@ -562,4 +570,15 @@ def extract(text: str, pos: int, name: str = "", foots=None,
     if qp:
         return {"proposition": _clean(qp), "kind": "parenthetical", "source": "body",
                 "needs_attention": _is_bare(qp), "reason": ""}
+    if is_id:
+        # Fix 6 (Finding 3): an Id. TERMINATES its sentence. Its "." is an
+        # abbreviation dot the forward sentence-walk would otherwise cross,
+        # swallowing the FOLLOWING sentence (card 180 pulled Davenport's
+        # quote from the next sentence). An Id.'s proposition is the
+        # PRECEDING substantive sentence, never the following one.
+        ps, pe = _prev_sentence_bounds(text, pos, masked)
+        prop = _clean(_decite(text[ps:pe]))
+        if not _is_bare(prop):
+            return {"proposition": prop, "kind": "id_prop", "source": "body",
+                    "needs_attention": False, "reason": ""}
     return _host_proposition(text, pos, masked)

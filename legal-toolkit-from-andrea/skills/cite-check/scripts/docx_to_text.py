@@ -2,7 +2,7 @@
 """docx_to_text.py -- extract a .docx/.dotx brief to plain text with each
 footnote spliced INLINE at its reference marker.
 
-Why this exists (2026.07.13, QA-Brief Opposition to Interpleader miss):
+Why this exists (2026.07.13, Brief C Opposition to Interpleader miss):
 The cite-check pipeline is citation-anchored and its proposition logic keys
 off adjacency -- a citation's proposition is the sentence it sits next to.
 python-docx's ``paragraph.text`` silently drops BOTH the footnote reference
