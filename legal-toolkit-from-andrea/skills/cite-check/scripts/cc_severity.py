@@ -2,7 +2,7 @@
 
 Every citation runs four independent checks -- Identity, Quote, Support,
 Treatment -- and the card's tier is the WORST failing check (parent handoff
-SS2a, locked by author 2026.07.14). Each check row is computed from RESULT
+SS2a, locked by the attorney 2026.07.14). Each check row is computed from RESULT
 PRIMITIVES (G8): name_cite_ok, quote_results/quote_fabricated,
 score/supports/inextractability, pincite_given/found, and the goodlaw
 treatment class. The folded 11-verdict key from cite_check_report._verdict
@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import re
 
-# Phase 8 (author 2026.07.15): five tiers. UNVERIFIED is its own bucket
+import cc_application as ccapp
+
+# Phase 8 (the attorney 2026.07.15): five tiers. UNVERIFIED is its own bucket
 # -- authorities the tool could not check at all (not found in any free
 # database, wrong document retrieved, identity unconfirmable). Ranked
 # ABOVE Defect (a case nobody checked outranks a weak-support flag) and
@@ -96,7 +98,7 @@ def _identity_unconfirmed(r):
     opinion IS the cited case; when identity is unconfirmed, the Quote and
     Support checks must not escalate above the Identity row's REVIEW -- a
     missing quote or weak support against the WRONG opinion is not attributable
-    to the brief (2026.07.14, QA-Brief Cit 18: 116 F.4th 422 mis-resolved to a
+    to the brief (2026.07.14, Brief C Cit 18: 111 F.4th 111 mis-resolved to a
     2019 record; the quote absence there is meaningless)."""
     return (getattr(r, "opinion_resolved", False)
             and getattr(r, "name_cite_ok", None) is False
@@ -109,14 +111,14 @@ def _wrong_document(r):
     """True when Step 6.6 confirmed the resolved opinion is a DIFFERENT
     document (genuine wrong case or CL-coverage wrong document). Quote and
     Support findings computed against the wrong document are meaningless
-    and must never escalate the card (Phase 7, QA-Brief cit 18 -- the quote
+    and must never escalate the card (Phase 7, Brief C cit 18 -- the quote
     absence from a 2019 Delaware filing says nothing about the brief)."""
     return ((getattr(r, "verification_finding", "") or "")
             == "confirmed_wrong_case")
 
 
 def _reporter_style_cite(r):
-    """The citation is a reporter/opinion cite (e.g. '116 F.4th 422'), not an
+    """The citation is a reporter/opinion cite (e.g. '111 F.4th 111'), not an
     inherently docket-style reference."""
     if getattr(r.citation, "reporter_cite", None):
         return True
@@ -129,8 +131,8 @@ def _recap_wrong_document(r):
     CourtListener's citation-lookup index (status 404) or the pincite could
     not be located on reporter pagination -- the resolver landed on the wrong
     document. Findings scored against such a record are meaningless; the
-    Support axis must render UNABLE, never DOES NOT SUPPORT (author
-    2026.07.15, QA-Brief cit 18: 116 F.4th 422 resolved to a bankruptcy
+    Support axis must render UNABLE, never DOES NOT SUPPORT (the attorney
+    2026.07.15, Brief C H-Corp cit 18: 111 F.4th 111 resolved to a bankruptcy
     docket ENTRY, then the tool scored 'does not support' against it)."""
     if not getattr(r, "opinion_resolved", False):
         return False
@@ -148,7 +150,7 @@ def _bracket_region_flags(quote):
     inside a [...] bracket span (a Bluebook alteration), tracking bracket
     depth so every interior token of a multi-word substitution like
     '[the judgment debtor]' counts -- not only the tokens carrying a literal
-    bracket char. Fixes the QA-Brief cit 16 miscount where the bracket-less
+    bracket char. Fixes the Brief C cit 16 miscount where the bracket-less
     interior word 'judgment' was treated as an unbracketed change."""
     flags, depth = [], 0
     for tok in (quote or "").split():
@@ -169,15 +171,44 @@ def _fab_confirmed(q):
 # ---------------------------------------------------------------------------
 # Check 1 -- Existence & Identity
 # ---------------------------------------------------------------------------
+def _outside_cl_coverage(r):
+    """True when the cite is from a court CourtListener does not index (e.g.
+    the Texas Business Court), so a reporter-lookup 404 is a COVERAGE gap, not
+    a hallucinated-authority signal (Finding 7/I2). Detected from court/docket
+    markers on the citation as written."""
+    c = getattr(r, "citation", None)
+    if c is None:
+        return False
+    hay = " ".join(str(getattr(c, f, "") or "")
+                   for f in ("cite_text", "name", "pin_cite")).lower()
+    rc = getattr(c, "reporter_cite", None) or {}
+    hay += " " + str(rc.get("reporter") or "").lower()
+    return bool(re.search(r"bus\.?\s*ct\.|business court|\b\d\d-bc\d", hay))
+
+
 def check_identity(r):
     if not r.opinion_resolved:
         # G7: reporter cite known to the lookup index shape but 404, AND the
         # case-name search returned zero hits -- the classic hallucinated-
-        # authority signature. Brazda-class records (real, published, cite
+        # authority signature. Doe-class records (real, published, cite
         # not indexed) resolve via the 404 name walk upstream, so they do
         # not reach this branch.
         if (getattr(r, "lookup_status", None) == 404
                 and "No results found." in (getattr(r, "search_detail", "") or "")):
+            if _outside_cl_coverage(r):
+                # Finding 7/I2: the cited court is outside CourtListener's
+                # coverage (e.g., the Texas Business Court), so a 404 + zero
+                # name hits is a coverage gap, NOT a nonexistent-authority
+                # signal. Soften to REVIEW; never imply the case is made up.
+                return _row(
+                    "Identity", "outside_coverage", TIER_UNVERIFIED,
+                    "OUTSIDE FREE-DATABASE COVERAGE", "tu",
+                    "The cited court is not indexed by CourtListener (e.g., "
+                    "the Texas Business Court), so the reporter lookup 404 "
+                    "and empty name search reflect a coverage gap, not a "
+                    "nonexistent authority. Verify on Westlaw or Lexis.",
+                    short="court outside CourtListener coverage — verify "
+                          "on Westlaw or Lexis")
             return _row(
                 "Identity", "possible_nonexistent", TIER_UNVERIFIED,
                 "POSSIBLE NONEXISTENT AUTHORITY", "t1",
@@ -193,7 +224,7 @@ def check_identity(r):
                     short="opinion not located")
     if (getattr(r, "verification_finding", "") or "") == "confirmed_wrong_case":
         if getattr(r, "lookup_status", None) == 404:
-            # Phase 7 (author 2026.07.15, QA-Brief cit 18): the cited reporter
+            # Phase 7 (the attorney 2026.07.15, Brief C cit 18): the cited reporter
             # address is NOT in CourtListener's citation-lookup index, so
             # the resolver landing on a different document is a database
             # COVERAGE artifact, not a positive wrong-case finding against
@@ -259,7 +290,7 @@ def check_quote(r):
     # Agent-located quotation (Step 6.6): when the must-verify loop confirmed
     # the quoted language verbatim on the fetched full opinion, the quote row
     # reflects that regardless of what the machine pass found on a trimmed
-    # copy -- QA-Brief as-filed Cit 19 (the "hammer/nail" quotation) that the
+    # copy -- Brief C as-filed Cit 19 (the "hammer/nail" quotation) that the
     # stale 25-character branch wrongly reported as nothing-to-check.
     if getattr(r, "verification_override", False) and \
             (getattr(r, "verification_finding", "") or "") == "confirmed_supports":
@@ -268,7 +299,7 @@ def check_quote(r):
                     "manual verification (Step 6.6).",
                     short="quote verified (agent-located)")
     if not qrs:
-        # Every direct quotation must be checked (author, 2026.07.15) -- the
+        # Every direct quotation must be checked (the attorney, 2026.07.15) -- the
         # 25-character floor is retired. An empty quote_results here means no
         # quoted span was machine-locatable in the citing sentence; if
         # quotation marks are present, route to a hand check rather than
@@ -298,7 +329,7 @@ def check_quote(r):
     fabs_c = [q for q in fabs if _fab_confirmed(q)]
     fabs_u = [q for q in fabs if not _fab_confirmed(q)]
     if fabs_c:
-        # Phase 7 (author 2026.07.15): EVERY confirmed-absent quotation is
+        # Phase 7 (the attorney 2026.07.15): EVERY confirmed-absent quotation is
         # Critical, short spans included -- a fabricated two-word quote is
         # still a fabrication.
         f = fabs_c[0]
@@ -347,11 +378,11 @@ def check_quote(r):
         # A word-faithful quotation whose only differences are Bluebook
         # bracket substitutions and/or ellipsis elisions is NOT a misquote --
         # but the substitutions replace meaning-bearing terms, so an attorney
-        # must confirm each is a fair rendering of the source (author,
+        # must confirm each is a fair rendering of the source (the attorney,
         # 2026.07.15: new "verify brackets" review flag). Bracket-dominated
         # changes only, so a genuine unbracketed word-swap still lands as a
         # material misquote below.
-        # author 2026.07.15 (QA-Brief cits 16 & 10): brackets and CLEAN ellipsis
+        # the attorney 2026.07.15 (Brief C cits 16 & 10): brackets and CLEAN ellipsis
         # omissions are the ONLY permitted differences. ANY other alteration
         # -- an unbracketed word swap, OR a word dropped with no ellipsis --
         # is a material misquote (Tier 3). The matcher, when it has the full
@@ -369,7 +400,7 @@ def check_quote(r):
             _op_pairs = _diff.get("opinion", [])
             _region = _bracket_region_flags(_qtext)
             # (a) any CHANGED brief word outside a [...] span is a genuine
-            #     addition/substitution (QA-Brief cit 16: "to pay the judgment").
+            #     addition/substitution (Brief C cit 16: "to pay the judgment").
             _brief_alt = False
             for _i, _pair in enumerate(_brief_pairs):
                 if not _pair[1]:
@@ -383,7 +414,7 @@ def check_quote(r):
             # (b) each opinion-side run MISSING from the brief must be
             #     explained by a bracket substitution or an ellipsis; more
             #     runs than (brackets + ellipses) means a word was dropped
-            #     silently (QA-Brief cit 10: "ask for [an order of] interpleader"
+            #     silently (Brief C cit 10: "ask for [an order of] interpleader"
             #     omitted with NO ellipsis).
             _op_runs, _prev = 0, False
             for _pair in _op_pairs:
@@ -471,7 +502,7 @@ def check_support(r):
                     "reliable. See the Identity row.",
                     short="support not scored — identity unconfirmed")
     if _recap_wrong_document(r):
-        # author 2026.07.15 (QA-Brief cit 18): a reporter cite that
+        # the attorney 2026.07.15 (Brief C H-Corp cit 18): a reporter cite that
         # resolved to a RECAP/PACER docket record is a wrong document -- the
         # Support axis must say "could not locate the cited opinion", never
         # affirmatively classify support/DOES NOT SUPPORT against a random
@@ -486,7 +517,7 @@ def check_support(r):
                     short="could not locate the cited opinion — verify "
                           "on Westlaw or Lexis")
     if _wrong_document(r):
-        # Phase 7 (QA-Brief cit 18): a support score computed against the
+        # Phase 7 (Brief C cit 18): a support score computed against the
         # WRONG document is meaningless and must not escalate.
         return _row("Support", "wrong_document", TIER_UNVERIFIED,
                     "UNCHECKED", "tu",
@@ -495,7 +526,15 @@ def check_support(r):
                     "Identity row.",
                     short="support not scored — wrong document "
                           "resolved")
-    if getattr(r, "quote_fabricated", False):
+    if (getattr(r, "quote_fabricated", False)
+            and not getattr(r, "verification_override", False)):
+        # 2026.08.04: an evidence-gated Step 6.6 override (agent located the
+        # quoted words in the ACTUAL cited opinion -- the machine's copy was
+        # a same-name different opinion) outranks the machine fabrication
+        # grade here, exactly as it already does in check_quote and in the
+        # folded verdict. Without this ordering the card contradicted
+        # itself: Quote row VERIFIED (agent), Support row "fabricated
+        # quotation controls the verdict."
         return _row("Support", "superseded", None, "SUPERSEDED", CHIP_NA,
                     "Thematic support score (%.2f) is irrelevant — a "
                     "fabricated quotation controls the verdict." % r.score,
@@ -542,10 +581,50 @@ def check_support(r):
                     + "The cited page could not be located on the "
                       "paginated source copy. Check the pincite.",
                     short="pincite page not found")
+    # Application-sentence re-render (2026.08.04, locked design). Engages
+    # ONLY where the machine verdict would land does-not-support or the
+    # weak-REVIEW branch. A characterization sentence ("reliance on X is
+    # misplaced") renders CITED TO DISTINGUISH; an application sentence
+    # whose authority carries a VERIFIED rule instance elsewhere renders
+    # APPLIED RULE -- VERIFIED ELSEWHERE (Tier 4 REVIEW, never PASS). An
+    # application sentence with NO verified sibling stays DOES NOT SUPPORT
+    # with an additive note -- bad cites are never masked.
+    _app_thin = 0 < getattr(r, "opinion_chars", 0) < THIN_OPINION_CHARS
+    _app_unavail = (not r.supports and r.score == 0.0
+                    and r.inextractability_score == 0.0)
+    _app_rr = ccapp.rerender_key(r, quote_matched, _app_thin, _app_unavail)
+    if _app_rr == "distinguish":
+        return _row("Support", "cited_to_distinguish", TIER_REVIEW,
+                    "CITED TO DISTINGUISH", "t4",
+                    "The brief cites this authority to distinguish or "
+                    "discount it, so a low support score is the expected "
+                    "shape, not a defect. The sentence's claim about the "
+                    "cited case may still be checkable -- read the opinion "
+                    "before relying on the characterization.",
+                    short="cited to distinguish -- review the "
+                          "characterization by hand")
+    if _app_rr == "applied_rule":
+        _sib = getattr(r, "applied_rule_sibling", None) or {}
+        _sibbits = "Citation %s" % _sib.get("cit_num", "?")
+        if _sib.get("pincite"):
+            _sibbits += " (pincite %s%s)" % (
+                _sib.get("pincite"),
+                " -- same pincite" if _sib.get("same_pincite") else "")
+        return _row("Support", "applied_rule", TIER_REVIEW,
+                    "APPLIED RULE — VERIFIED ELSEWHERE", "t4",
+                    "This sentence APPLIES the cited rule to the facts of "
+                    "this case, a form the support classifier scores low by "
+                    "construction. The same authority's underlying rule is "
+                    "verified elsewhere in this brief at %s. The citation "
+                    "is sound; review the application sentence itself."
+                    % _sibbits,
+                    short="applied rule -- underlying rule verified "
+                          "elsewhere in the brief")
     if r.inextractability_score >= 0.7 and not quote_matched:
         txt = ("The cited page does not back the proposition (confidence "
                "%.2f, inextractability %.2f)."
                % (r.score, r.inextractability_score))
+        txt += ccapp.application_note(r)
         if vf == "confirmed_does_not_support":
             txt += " Confirmed by manual verification (Step 6.6)."
         elif vf == "unable":
@@ -632,7 +711,7 @@ def check_treatment(r, tcls=None, tentry=None):
     cov = (tentry or {}).get("coverage", "") or ""
     ceiling = " The coverage sentence is the ceiling of the claim."
     if tcls == "negative":
-        # Phase 8 (author 2026.07.15): the goodlaw pass yields PROXIMITY
+        # Phase 8 (the attorney 2026.07.15): the goodlaw pass yields PROXIMITY
         # evidence, never a confirmed holding -- a negative signal alone
         # is a Review item (verify the treatment on Westlaw or Lexis),
         # not a fix-before-filing Defect.

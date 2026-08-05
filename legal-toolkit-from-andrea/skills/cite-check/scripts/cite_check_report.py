@@ -9,8 +9,7 @@ into a human-readable artifact.  Three formats:
     * render_markdown(results, meta)     -> str   (for pasting / .txt output)
     * render_docx(results, meta, out)    -> None  (Word document via docx-js)
 
-Styling follows the HTML Artifact design recipe in CLAUDE.md:
-Serif body and heading typography, teal
+Styling: neutral serif stack (Palatino/Georgia), teal
 section labels, amber/red/green flag colors for QA verdicts.
 
 render_html and render_markdown have no external dependencies.
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Sequence
 
 from cite_check import CiteCheckResult
+import cc_application as ccapp
 
 
 # --------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def _balance_display_quotes(s: str) -> str:
 
     Proposition extraction can strip a leading quotation mark (the parenthetical
     ("...") wrapper), leaving a dangling closing quote so the reader cannot see
-    where the checkable quote begins (QA-Brief as-filed Cits 2 & 7). This adds the
+    where the checkable quote begins (Brief C as-filed Cits 2 & 7). This adds the
     missing delimiter so the quoted span reads cleanly; it never changes the
     text that was verified, only what is shown.
     """
@@ -153,6 +153,15 @@ def _verdict(result: CiteCheckResult) -> str:
             and not (result.supports and result.score >= 0.8)):
         return "cited_as_contrary"
 
+    # Application-sentence re-render (2026.08.04): same single source of
+    # truth as cc_severity.check_support (cc_application.rerender_key).
+    _app_unavail = (not result.supports and result.score == 0.0
+                    and result.inextractability_score == 0.0)
+    _app_rr = ccapp.rerender_key(result, quote_matched, thin, _app_unavail)
+    if _app_rr == "distinguish":
+        return "cited_to_distinguish"
+    if _app_rr == "applied_rule":
+        return "applied_rule"
     # Opinion found but holding flatly contradicts the cited proposition.
     # A located verbatim quote outranks a high inextractability score.
     if result.inextractability_score >= 0.7 and not quote_matched:
@@ -193,6 +202,8 @@ _VERDICT_LABEL = {
     "pincite_unconfirmed": "Supported · Page Unverified",
     "partial": "Text Unavailable",
     "flagged": "Flagged",
+    "applied_rule": "Applied Rule — Verified Elsewhere",
+    "cited_to_distinguish": "Cited to Distinguish — Review",
     "does_not_support": "Does Not Support",
     "cited_as_contrary": "Cited as Contrary",
     "identity_unconfirmed": "Identity Unconfirmed",
@@ -207,6 +218,8 @@ _VERDICT_HEX = {
     "pincite_unconfirmed": "#00838F",
     "partial": "#2E8BC0",
     "flagged": "#E8870E",
+    "applied_rule": "#B8860B",
+    "cited_to_distinguish": "#B8860B",
     "does_not_support": "#D44040",
     "cited_as_contrary": "#455A64",
     "identity_unconfirmed": "#C2185B",
@@ -221,6 +234,8 @@ _VERDICT_BG = {
     "pincite_unconfirmed": "#E0F7FA",
     "partial": "#E3F2FD",
     "flagged": "#FFF3E0",
+    "applied_rule": "#FBF6E3",
+    "cited_to_distinguish": "#FBF6E3",
     "does_not_support": "#FDECEC",
     "cited_as_contrary": "#ECEFF1",
     "identity_unconfirmed": "#FCE4EC",
@@ -230,7 +245,7 @@ _VERDICT_BG = {
 }
 
 # Ordered list for summary tables and status keys
-_VERDICT_ORDER = ["verified", "somewhat", "pincite_unconfirmed", "partial", "flagged", "does_not_support", "cited_as_contrary", "identity_unconfirmed", "pincite_not_found", "prop_not_extracted", "unable"]
+_VERDICT_ORDER = ["verified", "somewhat", "pincite_unconfirmed", "partial", "flagged", "applied_rule", "cited_to_distinguish", "does_not_support", "cited_as_contrary", "identity_unconfirmed", "pincite_not_found", "prop_not_extracted", "unable"]
 
 _VERDICT_KEY_TEXT = {
     "verified": "Green light. We found the opinion, and its holding supports the exact point the brief cites it for, at the page cited. Nothing to do.",
@@ -238,6 +253,8 @@ _VERDICT_KEY_TEXT = {
     "pincite_unconfirmed": "Two separate things: (1) the opinion DOES support the point \u2014 that is confirmed; (2) we could NOT confirm the specific PAGE cited, because the copy we retrieved has no reporter page numbers to check against (e.g. a Westlaw \"WL\" cite pulled from a free source or PACER, which number pages differently). So support = yes, page = could not check. This is NOT a page error \u2014 see \"Page Not Found\" for that. (Confidence score on the card shows how strong the support is.)",
     "partial": "We found the opinion but could not get its full text, so we could not check whether it supports the point. Pull it manually to confirm.",
     "flagged": "We found the opinion, but something needs a human eye: the support is weak or unclear, the language may be dicta, or there is a discrepancy. Read it before relying on it.",
+    "applied_rule": "The sentence this case is cited for APPLIES the cited rule to the facts of this case (e.g. \u201cBecause no defendant has liability, the conspiracy theory fails\u201d), so the support classifier scores it against the opinion text and lands low by construction. The same authority\u2019s underlying rule IS verified at another citation in this brief (the card names it). The citation is sound; review the application sentence, not the cite.",
+    "cited_to_distinguish": "The brief cites this authority to distinguish or discount it (\u201creliance on X is misplaced\u201d), so a low support score is the expected shape, not a defect. The characterization\u2019s claim about the cited case may still be checkable \u2014 read the opinion before relying on it.",
     "does_not_support": "Red flag. We found the opinion and it does NOT support \u2014 or actually cuts against \u2014 the point the brief cites it for. Review before filing.",
     "cited_as_contrary": "Not an error. The brief itself cites this case as contrary authority (e.g. \"but see\"), so a low or negative support score is expected and correct.",
     "identity_unconfirmed": "We found AN opinion, but could not confirm it is the SAME case the brief cites \u2014 the name or reporter citation did not line up (often a different case sharing a surname). Treat as possibly the wrong case and verify the citation.",
@@ -750,8 +767,17 @@ h2 { font-family: Georgia, serif; font-size: 1.25rem;
   border-bottom: 3px solid transparent; margin-bottom: -2px; }
 .tabbar button.on { color: var(--teal); font-weight: 700;
   border-bottom-color: var(--teal); }
-.tabpane { display: none; }
+.tabpane { display: block; scroll-margin-top: 12px; }
 .tabpane.on { display: block; }
+/* Fix 10a (addendum): panes stay in the document flow so browser
+   Ctrl+F finds verification evidence (PASS cards) that used to live
+   only inside a display:none pane. Tabs act as jump navigation. */
+.tabpane + .tabpane { border-top: 2px solid var(--rule);
+  margin-top: 30px; padding-top: 6px; }
+.panelabel { font-family: Georgia, serif;
+  color: var(--teal); font-size: 1.15rem; margin: 10px 0 6px;
+  letter-spacing: .02em; }
+[id$='card-1'],[id*='card-'] { scroll-margin-top: 14px; }
 .actgroup { background: #fff; border: 1px solid var(--rule);
   border-radius: 10px; padding: 11px 16px; margin: 10px 0; }
 .actgroup .ghead { font-weight: 700; letter-spacing: .04em;
@@ -853,9 +879,11 @@ a { color: var(--teal); }
 @@TRIAGE_CARDS@@
 </div>
 <div id="tab-all" class="tabpane">
+<h2 class="panelabel">All citations</h2>
 @@CARDS@@
 </div>
 <div id="tab-method" class="tabpane">
+<h2 class="panelabel">Methodology and detail</h2>
 @@NOT_CHECKED@@
 @@STATUS_KEY@@
 @@SECTIONS@@
@@ -863,17 +891,16 @@ a { color: var(--teal); }
 </div>
 <script>
 function showTab(id) {
+  // Fix 10a: panes are always in the searchable flow; tabs are jump nav.
   var panes = ["triage", "all", "method"];
   for (var i = 0; i < panes.length; i++) {
-    document.getElementById("tab-" + panes[i]).className =
-      "tabpane" + (panes[i] === id ? " on" : "");
     document.getElementById("tb-" + panes[i]).className =
       (panes[i] === id ? "on" : "");
   }
-  window.scrollTo(0, 0);
+  var el = document.getElementById("tab-" + id);
+  if (el) el.scrollIntoView({behavior: "smooth"});
 }
 function jumpTo(cardId) {
-  showTab("all");
   var el = document.getElementById(cardId);
   if (el) el.scrollIntoView();
 }
@@ -925,7 +952,7 @@ def _has_party_name(name):
 
 def _lead_party(name):
     """The lead party of a case name ('Madeksho v. Abraham...' -> 'Madeksho';
-    'Matter of QA-Brief Capital Mgmt., L.P.' -> 'Matter of QA-Brief Capital
+    'In re H-Corp Holdings, L.P.' -> 'In re H-Corp Holdings
     Mgmt.')."""
     nm = re.split(r"\s+v\.?\s+", (name or "").strip(), maxsplit=1)[0].strip()
     return nm.split(",")[0].strip()
@@ -944,7 +971,7 @@ def _slug_caption(url):
 
 def _attach_display_captions(results):
     """Give bare-reporter / short-form cards a resolved case-name prefix for
-    DISPLAY only (author 2026.07.15, QA-Brief cit 1: '112 S.W.3d 679' headlined a
+    DISPLAY only (the attorney 2026.07.15, Brief C cit 1: '112 S.W.3d 679' headlined a
     bare reporter with no case name). Never mutates citation.name. Caption
     source priority: a sibling citation resolving to the same opinion that
     carries a party name; else the opinion-URL slug. Idempotent."""
@@ -980,7 +1007,7 @@ def _attach_display_captions(results):
 def _body_only_display(results, meta):
     """The 'cited in body, missing from TOA' list, de-duplicated to ONE entry
     per resolved authority so a case cited under several aliases (bare
-    reporter, short form, 'Id.') is named just once (author 2026.07.15, QA-Brief:
+    reporter, short form, 'Id.') is named just once (the attorney 2026.07.15, Brief C:
     Madeksho appeared 6x). Falls back to meta's list when results carry no
     body_only flags."""
     out, seen, any_flag = [], set(), False
@@ -1033,7 +1060,7 @@ def _headline(r):
     base = ct or (r.citation.name or "").strip() or "(citation)"
     cap = (getattr(r, "_display_caption", "") or "").strip()
     # Prepend the resolved case name unless the headline already shows it
-    # (author 2026.07.15: no card should headline a bare reporter/short form).
+    # (the attorney 2026.07.15: no card should headline a bare reporter/short form).
     if cap and cap.split()[0].lower() not in base.lower():
         return cap + ", " + base
     return base
@@ -1046,7 +1073,7 @@ def _chip_html(row):
 
 def _diff_html(diff):
     """Misquote word-diff block: brief additions and opinion words missing
-    from the brief, both red-bolded (author 2026.07.15)."""
+    from the brief, both red-bolded (the attorney 2026.07.15)."""
     if not diff:
         return ""
     esc = html.escape
@@ -1181,12 +1208,23 @@ def _nested_html(n, child, parent_checks):
     else:
         status = ('Source could not be retrieved from free databases — '
                   'confirm it by hand. Not scored as a standalone citation.')
+    # Session E (2026.07.30): a nested quoted-source child can still carry a
+    # Step 6.6 manual-verification finding (e.g. PPG [85]: the quoted language
+    # attributed to the nested source is absent from that source's complete
+    # opinion -- a possible hallucinated quotation).  Surface it here; the
+    # nested block previously dropped it entirely.
+    _cvn = _verification_note(child)
+    vnote = ('<div class="note" style="color:#0B6E4F;font-weight:600">'
+             '<b>Manual verification (Step 6.6):</b> ' + esc(_cvn) + '</div>'
+             if _cvn else '')
     return ('<div class="nested"><span class="tag">QUOTED SOURCE · '
             'CITATION {n}</span>'
             '<div class="nhead">{head} — appears only inside the '
             'parent\'s “({kind} …)” parenthetical.</div>'
             '<div class="sr" style="margin-top:4px">{status}</div>'
-            '</div>').format(n=n, head=head, kind=esc(kind), status=status)
+            '{vnote}'
+            '</div>').format(n=n, head=head, kind=esc(kind), status=status,
+                             vnote=vnote)
 
 
 def _card_html(n, r, checks, nested_blocks):
@@ -1301,9 +1339,18 @@ def _card_html(n, r, checks, nested_blocks):
             body.append('<div class="note" style="color:#0B6E4F;'
                         'font-weight:600"><b>Manual verification '
                         '(Step 6.6):</b> ' + esc(_vn) + '</div>')
-        if not r.opinion_resolved and (getattr(r, "search_detail", "") or ""):
+        _sd = (getattr(r, "search_detail", "") or "").strip()
+        if not r.opinion_resolved and _sd:
             body.append('<div class="note"><b>Search attempted:</b> '
-                        + esc(r.search_detail) + '</div>')
+                        + esc(_sd) + '</div>')
+        elif _sd and ("STATUTE CHECK" in _sd
+                      or "Patched from free source" in _sd):
+            # Session E (2026.07.30): surface the source-provenance note
+            # (SCOTX/COA/Business Court builder patch, and the I3 statute
+            # check) on RESOLVED cards too -- otherwise it renders only when
+            # the opinion is unresolved and is lost on the cards it describes.
+            body.append('<div class="note"><b>Source note:</b> '
+                        + esc(_sd) + '</div>')
         if (r.notes or "").strip():
             body.append('<div class="note">' + esc(r.notes) + '</div>')
 
@@ -1335,7 +1382,7 @@ def _card_html(n, r, checks, nested_blocks):
 def _not_checked_reason(results, entry):
     """Run-accurate reason a case's TREATMENT could not be checked, derived
     from the citation's own resolution state so the text matches the run
-    (B8 Cit 3 fix -- Brazda DID resolve to a cluster, 2026.07.14)."""
+    (B8 Cit 3 fix -- Doe DID resolve to a cluster, 2026.07.14)."""
     idxs = entry.get("instance_indexes") or []
     r = results[idxs[0]] if idxs and idxs[0] < len(results) else None
     if r is not None:
@@ -1402,7 +1449,7 @@ def render_html(
         pieces.append("jurisdiction " + esc(str(meta["jurisdiction"])))
     meta_line = " · ".join(pieces)
 
-    # 5-tile verdict board (author 2026.07.15, option B).
+    # 5-tile verdict board (the attorney 2026.07.15, option B).
     tile_ncolor = {1: "var(--t1)", 2: "var(--tu)", 3: "var(--t3)",
                    4: "#9A7508", 5: "var(--t5)"}
     tile_lab = {1: "Critical", 2: "Unverified", 3: "Fix", 4: "Review",
@@ -1417,7 +1464,7 @@ def render_html(
                 lab=tile_lab[t]))
     board = '<div class="board">' + "".join(tiles) + '</div>'
 
-    # Action-grouped summary (author 2026.07.15): a to-do list, worst first.
+    # Action-grouped summary (the attorney 2026.07.15): a to-do list, worst first.
     group_head = {
         1: ("Critical — fix before filing", "var(--t1)"),
         2: ("Could not check — verify on Westlaw or Lexis", "var(--tu)"),
@@ -1516,7 +1563,8 @@ def render_html(
             'and the citations actually extracted from the body.</p>',
         ]
         if body_only:
-            parts.append('<h3 style="font-family:Georgia,serif;color:var(--t3);font-size:1rem">'
+            parts.append('<h3 style="font-family:'
+                         'Georgia,serif;color:var(--t3);font-size:1rem">'
                          'Cited in body, missing from TOA ('
                          + str(len(body_only)) + ')</h3>')
             parts.append('<ul style="font-size:.92rem">')
@@ -1529,7 +1577,8 @@ def render_html(
                              + '</li>')
             parts.append('</ul>')
         if toa_only:
-            parts.append('<h3 style="font-family:Georgia,serif;color:var(--partial);'
+            parts.append('<h3 style="font-family:'
+                         'Georgia,serif;color:var(--partial);'
                          'font-size:1rem">Listed in TOA, not cited in body ('
                          + str(len(toa_only)) + ')</h3>')
             parts.append('<ul style="font-size:.92rem">')
@@ -1604,8 +1653,8 @@ const dataPath = process.argv[2];
 const outPath = process.argv[3];
 const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
 
-// Fonts: portable serif document stack.
-const FB = "Palatino Linotype"; // body
+// Fonts: neutral serif stack throughout.
+const FB = "Palatino Linotype";  // body
 const FH = "Georgia";           // headings / title
 const INK = "1F2A2E";
 const MUTED = "5B6B70";
@@ -1635,11 +1684,13 @@ const verdictLabels = {
     pincite_unconfirmed: "SUPPORTED · PAGE UNVERIFIED",
     prop_not_extracted: "PROPOSITION NOT EXTRACTED",
     partial: "INDETERMINATE – TEXT UNAVAILABLE", flagged: "FLAGGED",
+    applied_rule: "APPLIED RULE — VERIFIED ELSEWHERE",
+    cited_to_distinguish: "CITED TO DISTINGUISH — REVIEW",
     does_not_support: "DOES NOT SUPPORT", cited_as_contrary: "CITED AS CONTRARY",
     identity_unconfirmed: "IDENTITY UNCONFIRMED",
     pincite_not_found: "PINCITE NOT FOUND", unable: "UNABLE TO VERIFY",
 };
-const verdictOrder = ["verified", "somewhat", "pincite_unconfirmed", "partial", "flagged", "does_not_support", "cited_as_contrary", "identity_unconfirmed", "pincite_not_found", "prop_not_extracted", "unable"];  // kept in sync with Python _VERDICT_ORDER
+const verdictOrder = ["verified", "somewhat", "pincite_unconfirmed", "partial", "flagged", "applied_rule", "cited_to_distinguish", "does_not_support", "cited_as_contrary", "identity_unconfirmed", "pincite_not_found", "prop_not_extracted", "unable"];  // kept in sync with Python _VERDICT_ORDER
 
 function tRun(text, opt) {
     opt = opt || {};
@@ -2028,8 +2079,27 @@ def _severity_model(results, meta):
     counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
     for i in range(len(results)):
         counts[checks_map[i]["tier"]] += 1
-    order = sorted((i for i in range(len(results)) if i not in nested_set),
-                   key=lambda i: (checks_map[i]["tier"], i))
+    # Fix 10b (2026.07.29, Session E): cluster an authority's instances
+    # adjacently.  Each cluster anchors at its WORST instance's severity-sorted
+    # position ((tier, index) of the worst member), so tier-level triage order
+    # is unchanged; within a cluster, members render worst-first.  Authorities
+    # cited once render exactly as before.
+    def _authority_key(i):
+        r = results[i]
+        tm = getattr(r.citation, "toa_match", None)
+        name = (tm.get("name") if tm and tm.get("name") else
+                getattr(r.citation, "name", "") or "")
+        key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        return key or "__solo_%d" % i
+    eligible = [i for i in range(len(results)) if i not in nested_set]
+    clusters = {}
+    for i in eligible:
+        clusters.setdefault(_authority_key(i), []).append(i)
+    anchor = {k: min((checks_map[i]["tier"], i) for i in idxs)
+              for k, idxs in clusters.items()}
+    order = []
+    for k in sorted(clusters, key=lambda k: anchor[k]):
+        order.extend(sorted(clusters[k], key=lambda i: (checks_map[i]["tier"], i)))
     return checks_map, nested_children, nested_set, counts, order
 
 

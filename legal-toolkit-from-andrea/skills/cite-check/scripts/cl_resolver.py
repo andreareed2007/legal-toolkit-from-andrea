@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import html as html_mod
 import logging
+import os
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -34,7 +36,7 @@ try:
 except ImportError:
     requests = None  # type: ignore[assignment]
 
-from cite_check import Citation
+from cite_check import Citation, _has_opinion_disposition
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,11 @@ _JURISDICTION_TO_CL_COURTS: Dict[str, List[str]] = {
     "US-TX": (
         ["tex", "texcrimapp", "texjpml", "texreview", "texag"]
         + [f"texapp{i}" for i in range(1, 15)]
+        # CourtListener's LIVE ids for the Texas Courts of Appeals are
+        # txctapp1-14 (verified against the API 2026.08.04); the texapp*
+        # spellings above never matched a real result and hard-rejected
+        # every Texas COA name-tier candidate (Traweek/Cantrell/Smith).
+        + [f"txctapp{i}" for i in range(1, 15)]
     ),
     # Federal circuit courts
     "US-CA1": ["ca1"],
@@ -161,7 +168,19 @@ def jurisdiction_matches(enricher_jurisdiction: Optional[str], cl_court_id: str)
     if "/" in cl_id:
         cl_id = cl_id.rstrip("/").rsplit("/", 1)[-1]
 
-    return cl_id in allowed_courts
+    if cl_id in allowed_courts:
+        return True
+    # 2026.08.04 (Traweek/Cantrell/Smith class): this map is hand-typed and
+    # provably incomplete -- CL's real Texas COA ids (txctapp*) were absent,
+    # so every correct candidate was HARD-rejected into an UNABLE. An id
+    # this map has never seen must not be treated as a cross-jurisdiction
+    # mismatch: fail OPEN and let the name-overlap and cite-address
+    # identity gates decide. An id the map DOES know (i.e., mapped to some
+    # jurisdiction, just not this one) still rejects.
+    _known = set()
+    for _courts in _JURISDICTION_TO_CL_COURTS.values():
+        _known.update(_courts)
+    return cl_id not in _known
 
 
 # --------------------------------------------------------------------------
@@ -512,7 +531,7 @@ def _pincite_footnote(citation):
     2026.07.04 (footnote fix): a brief citing 'at 852 n.1' is citing the
     OPINION'S footnote.  CL plain_text renders footnotes as endnotes after
     the body (often without their numbers), so the pincite window used to
-    silently exclude the very text the brief relies on -- the Gold-Set-A
+    silently exclude the very text the brief relies on -- the Brief A
     Alliance Network false "Does Not Support"."""
     for src in ((getattr(citation, "pincite", "") or ""),
                 (getattr(citation, "pin_cite", "") or ""),
@@ -691,6 +710,87 @@ def justia_ny_slip_op_url(reporter_cite):
             "%s/%s-ny-slip-op-%s-u.html" % (year, year, num))
 
 
+# --------------------------------------------------------------------------
+# Session E (2026.07.29): deterministic Texas builders (I1 / I2 / SCOTX).
+# --------------------------------------------------------------------------
+_TX_ORDINALS = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth",
+}
+_TX_COA_DOCKET_RE = re.compile(r"(0[1-9]|1[0-4])-(\d{2})-(\d{5})-(CV|CR)", re.I)
+_SCOTX_DOCKET_RE = re.compile(r"\d{2}-\d{4}")
+_TX_BC_DOCKET_RE = re.compile(r"\d{2}-BC\d{2}[A-Za-z]-\d{4}", re.I)
+
+
+def justia_txcoa_urls(citation):
+    """I1 (2026.07.29): deterministic Justia URLs for a Texas COA docket-cited
+    case: law.justia.com/cases/texas/{ordinal}-court-of-appeals/{year}/{docket}
+    (docket prefix 01-14 encodes the court).  Returns candidates for the docket
+    year AND the following year (a decision often issues the year after
+    filing).  Validated live 2026.07.29 (Raphael, 05-24-00053-CV -> full
+    opinion via web_fetch; note law.justia.com bot-blocks plain requests)."""
+    dkt = _docket_number(citation)
+    m = _TX_COA_DOCKET_RE.fullmatch(dkt or "")
+    if not m:
+        return []
+    ordinal = _TX_ORDINALS[int(m.group(1))]
+    year = 2000 + int(m.group(2))
+    dl = dkt.lower()
+    out = []
+    # Decision year can lag the docket year by up to two years (validated:
+    # Kassab 01-24-00220-CV decided 2026).  The cases.justia.com PDF mirror
+    # accepts plain requests (no bot block -- validated 2026.07.29), so list
+    # it beside each HTML page URL.
+    for y in (year, year + 1, year + 2):
+        out.append(("justia",
+                    "https://law.justia.com/cases/texas/%s-court-of-appeals/%d/%s.html"
+                    % (ordinal, y, dl)))
+        out.append(("justia",
+                    "https://cases.justia.com/texas/%s-court-of-appeals/%d-%s.pdf"
+                    % (ordinal, y, dl)))
+    return out
+
+
+def txcourts_case_search_url(citation):
+    """SCOTX builder step 1 (2026.07.29): the official search.txcourts.gov CASE
+    page for a Supreme Court of Texas docket (NN-NNNN, e.g. 21-0641).  The page
+    lists the case's opinions with issue dates and SearchMedia PDF links, but
+    the page itself is a NAVIGATION HINT, never opinion body -- the agent
+    follows the opinion media link and patches THAT document (see
+    _looks_like_case_search_page).  Fetchable via plain requests (validated
+    2026.07.29, McLane 21-0641)."""
+    dkt = _docket_number(citation)
+    if dkt and _SCOTX_DOCKET_RE.fullmatch(dkt):
+        return "https://search.txcourts.gov/Case.aspx?cn=%s&coa=cossup" % dkt
+    return ""
+
+
+def txcourts_bc_index_url(citation):
+    """I2 (2026.07.29): the Texas Business Court opinions index for a Tex. Bus.
+    Ct. docket (NN-BCnnX-NNNN).  CL 404s on this court; opinions live on
+    txcourts.gov media pages linked from this index.  NAVIGATION HINT only."""
+    dkt = _docket_number(citation)
+    if dkt and _TX_BC_DOCKET_RE.fullmatch(dkt):
+        return "https://www.txcourts.gov/businesscourt/opinions/"
+    return ""
+
+
+_CASE_SEARCH_PAGE_MARKERS = re.compile(
+    r"Case Events|Appellate Briefs|Calendars|Trial Court Information"
+    r"|Party Information|Set for Submission|SearchMedia\.aspx", re.I)
+
+
+def _looks_like_case_search_page(text):
+    """True if `text` reads like a txcourts case-search CASE page (docket/event
+    index) rather than an opinion.  Guard for patch_gap: the docket-number
+    identity branch would otherwise accept a case page (it prints the docket)
+    as opinion text."""
+    if not text:
+        return False
+    return len(_CASE_SEARCH_PAGE_MARKERS.findall(text[:20000])) >= 2
+
+
 def fallback_candidates(citation):
     """Ordered list of (source, url) to try when CourtListener has no opinion.
     Order is convenience, not hierarchy -- ANY free source that returns the
@@ -709,6 +809,16 @@ def fallback_candidates(citation):
     jx = justia_ny_slip_op_url(reporter)
     if jx:
         out.append(("justia", jx))
+    # Session E (2026.07.29): deterministic Texas candidates.  The two
+    # txcourts entries are NAVIGATION HINTS for the agent-driven gap loop
+    # (resolve_via_fallback skips them; patch_gap rejects a case page).
+    out.extend(justia_txcoa_urls(citation))
+    tx = txcourts_case_search_url(citation)
+    if tx:
+        out.append(("txcourts_case_page", tx))
+    bc = txcourts_bc_index_url(citation)
+    if bc:
+        out.append(("txcourts_bc_index", bc))
     return out
 
 
@@ -731,6 +841,12 @@ def fallback_opinion_url(citation):
 REPORTED_SEARCH_DOMAINS = [
     "law.justia.com", "cases.justia.com", "supreme.justia.com",
     "caselaw.findlaw.com", "www.txcourts.gov",
+    # Session E (2026.07.29): CaseMine as a GENERAL free source (the attorney,
+    # Session D closeout SS4).  JS-render check FAILED 2026.07.29: judgment
+    # pages return EMPTY via web_fetch and the sandbox proxy blocks the
+    # domain outright -- BEST-EFFORT discovery source only; a hit must be
+    # copied/fetched by some other means before patch_gap can ingest it.
+    "www.casemine.com",
 ]
 
 # Generic party-name tokens that don't identify a case on their own.
@@ -760,6 +876,8 @@ def _source_for_url(url):
         return "justia"
     if "findlaw.com" in u:
         return "findlaw"
+    if "casemine.com" in u:
+        return "casemine"
     if "nycourts.gov" in u:
         return "nycourts_reporter"
     if "txcourts.gov" in u:
@@ -786,6 +904,11 @@ def extract_opinion_body(content, source="", url=""):
         body = strip_html(content) if looks_html else content
         body = _FINDLAW_FOOTER_RE.sub("", body)
         return _collapse_text(body)
+    if src == "casemine":
+        # Session E (2026.07.29): generic tag-strip; no stable footer marker
+        # observed (fetch path currently returns empty -- best-effort source).
+        body = strip_html(content) if looks_html else content
+        return _collapse_text(body)
     # reporter / txcourts / unknown: strip tags if HTML, else (PDF text) as-is
     if looks_html:
         return _collapse_text(strip_html(content))
@@ -799,6 +922,77 @@ def _cite_core(reporter):
     if not m:
         return "", ""
     return m.group(1), m.group(2)
+
+
+_DOCKET_RE = re.compile(
+    r"\b(\d{1,2}-\d{2}-\d{4,6}-[A-Za-z]{2}"
+    r"|\d{2}-BC\d{2}[A-Za-z]-\d{4}"
+    r"|\d{1,2}:\d{2}-[A-Za-z]{2,3}-\d{3,6}"
+    r"|\d{2}-\d{3,4})\b")
+
+
+def _docket_number(citation):
+    """Best docket number for a citation (from cite_text / name / pin), or ''.
+    Whitespace is stripped first because eyecite can split a docket fragment
+    ("No. 05-24- 00053-CV")."""
+    for src in (getattr(citation, "cite_text", "") or "",
+                getattr(citation, "name", "") or "",
+                getattr(citation, "pin_cite", "") or ""):
+        m = _DOCKET_RE.search(re.sub(r"\s+", "", src))
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _docket_in_body(dkt, text):
+    """True if docket number `dkt` co-occurs in `text` (whitespace-insensitive)."""
+    if not dkt or not text:
+        return False
+    return re.sub(r"\s+", "", dkt).lower() in re.sub(r"\s+", "", text).lower()
+
+
+_DOCKET_SHEET_MARKERS = re.compile(
+    r"represented by|LEAD ATTORNEY|ATTORNEY TO BE NOTICED|TERMINATED:"
+    r"|Date Filed\s*#\s*Docket Text|PACER Service Center"
+    r"|Docket (?:Text|Report)|Query\s+Reports", re.IGNORECASE)
+
+
+def _looks_like_docket_sheet(text):
+    """True if `text` reads like a PACER docket sheet / party-attorney index
+    rather than an opinion (B1: [5] Temple v. Cortez resolved to a docket
+    sheet whose body is a party-name index)."""
+    if not text:
+        return False
+    return len(_DOCKET_SHEET_MARKERS.findall(text[:8000])) >= 3
+
+
+def _recap_body_acceptable(citation, text):
+    """B1 (2026.07.29): guard the RECAP fallback. The fallback exists for
+    WL/LEXIS database cites whose opinions live only in the docket. When the
+    brief cites a PUBLISHED reporter (S.W.3d, U.S., F.4th, ...), the opinion
+    belongs in the Opinions DB; a RECAP hit is usually a docket sheet or an
+    interlocutory filing, not the opinion ([5] Temple docket sheet; [19/20]
+    Gensetix 3.9k federal filing). Accept for a published-reporter cite only
+    when the body reads like the opinion (disposition marker, not a docket
+    sheet) AND actually carries the cited reporter address or docket number."""
+    if not text:
+        return False
+    fam = _reporter_family(reporter_cite_str(citation) or "")
+    is_published = (bool(fam) and fam not in _DB_REPORTER_FAMS
+                    and "lexis" not in fam)
+    if not is_published:
+        return True
+    if len(text) < 2500 or _looks_like_docket_sheet(text):
+        return False
+    try:
+        if not _has_opinion_disposition(text):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    if _name_or_cite_match(citation, text) is True:
+        return True
+    dkt = _docket_number(citation)
+    return bool(dkt and _docket_in_body(dkt, text))
 
 
 def _name_or_cite_match(citation, text):
@@ -831,7 +1025,18 @@ def _name_or_cite_match(citation, text):
     toks = {t.lower() for t in re.split(r"[^A-Za-z]+", name)
             if len(t) >= 3 and t.lower() not in _NAME_STOP}
     matched = sum(1 for t in toks if t in low)
-    return matched >= 2
+    if matched >= 2:
+        return True
+    # Section B (2026.07.29): docket-number match branch. WL-only-cited COA
+    # opinions whose eyecite name is a docket fragment ("No. 05-24-00053-CV")
+    # or a single token pass neither the reporter branch (WL numbers never
+    # appear in opinion bodies) nor the >=2-name-token branch, even with the
+    # correct opinion in hand. Docket numbers ARE printed in opinions and are
+    # highly distinctive, so a docket co-occurrence is an accept signal.
+    dkt = _docket_number(citation)
+    if dkt and _docket_in_body(dkt, text):
+        return True
+    return False
 
 
 def _append_lookup_note(citation, note):
@@ -869,12 +1074,35 @@ def _lookup_name_check(citation, cluster_name):
     Zero-overlap-only mismatch is deliberately conservative: a false reject
     here loses a real citation, the regression the resolver gate's
     REAL-LOSS class exists to catch."""
-    want = _name_tokens(_expand_abbrev(_clean_case_name(citation)))
+    # 2026.08.04 (v16 Williams-short fix): a short form whose brief-side
+    # "name" is the cite string itself ("789 S.W.2d at 265", "Id.") yields
+    # only numeric/reporter tokens. Those are not NAME evidence -- comparing
+    # them zero-overlap-REJECTED the lookup's own correct cluster and gap'd
+    # a Texas Supreme Court case. Strip them (shared _case_name_tokens
+    # hygiene); empty -> nocompare (accept + warn).
+    want = {t for t in _name_tokens(_expand_abbrev(_clean_case_name(citation)))
+            if not t.isdigit() and t not in _CITEISH_TOKENS}
     have = _name_tokens(_expand_abbrev(cluster_name or ""))
     if not want or not have:
         return "nocompare"
     return "match" if (want & have) else "mismatch"
 
+
+_CITEISH_TOKENS = {"id", "at", "supra", "ante", "2d", "3d", "4th",
+                   "5th", "6th", "7th", "wl", "lexis", "supp",
+                   "cv", "cr", "no"}
+
+
+def _case_name_tokens(citation) -> set:
+    """Distinctive NAME tokens of the brief-side case name -- docket-number
+    fragments ("No. 02-20-00311-CV" -> 02/20/00311/cv), reporter series, and
+    cite furniture stripped. 2026.08.04: those junk tokens inflated the
+    name-overlap coverage requirement in _pick_best_result, so "Traweek v.
+    Long, No. 02-20-00311-CV" (6 tokens, coverage 3) could never be covered
+    by the caption's real 2 shared name tokens -- every correct Texas COA
+    candidate was rejected."""
+    return {t for t in _name_tokens(_clean_case_name(citation))
+            if not t.isdigit() and t not in _CITEISH_TOKENS}
 
 _SERIES_SUFFIX_RE = re.compile(r"(?:2d|3d|4th|5th|6th|7th)$")
 
@@ -1358,7 +1586,7 @@ class CLResolver:
             now = time.time()
             if now - st["win_start"] >= 60:
                 st["win_start"], st["win_cites"] = now, 0
-            if st["win_cites"] + len(chunk) > _LOOKUP_PACE_CITES:
+            if st["win_cites"] > 0 and st["win_cites"] + len(chunk) > _LOOKUP_PACE_CITES:
                 wait = 60 - (now - st["win_start"]) + 1
                 if deadline is not None and now + wait > deadline:
                     self._lookup_map = st["map"]
@@ -1659,7 +1887,7 @@ class CLResolver:
             max_results = max(max_results, len(results))
             best = self._pick_best_result(results, citation, reporter_cite)
             cands = [best] if best is not None else []
-            # Brazda class (2026.07.14): a published opinion can exist on CL
+            # Doe class (2026.07.14): a published opinion can exist on CL
             # with its reporter cite never indexed (citation-lookup 404), and
             # the case-name search then surfaces near-duplicate clusters
             # (order entries, a slip copy) alongside the substantive published
@@ -1698,10 +1926,10 @@ class CLResolver:
             # resolves by generic name to a DIFFERENT case -- the matched
             # record carries other-reporter-family cites (not_on_record) AND
             # its decision YEAR contradicts the cited year by more than one
-            # (the QA-Brief "Matter of QA-Brief Capital Mgmt." -> In re Acis miss,
-            # cited 116 F.4th 422 (5th Cir. 2024) but matched a ~2019 record).
+            # (the Brief C "In re H-Corp Holdings" -> In re A-Co miss,
+            # cited 111 F.4th 111 (5th Cir. 2024) but matched a ~2019 record).
             # Scoped to PUBLISHED reporters: WL/LEXIS database cites (the RECAP
-            # class) and the Brazda class (empty citation field -> no_data)
+            # class) and the Doe class (empty citation field -> no_data)
             # never fire, so the recorded gate call sequence is unchanged.
             if opinion_text and getattr(citation, "_lookup_status", None) == 404:
                 _addr_kind, _ = _cite_address_check(reporter_cite, best)
@@ -1911,6 +2139,10 @@ class CLResolver:
         text = (doc or {}).get("plain_text") or ""
         if len(text) < 200:
             return None, None
+        # B1 (2026.07.29): reject docket sheets / interlocutory filings that
+        # are not the cited opinion (esp. for published-reporter cites).
+        if not _recap_body_acceptable(citation, text):
+            return None, None
         url = "https://www.courtlistener.com" + (best.get("absolute_url") or "")
         return text, url
 
@@ -1945,7 +2177,7 @@ class CLResolver:
         result is confidently the cited case.
         """
         norm_rep = _normalize_cite(reporter_cite)
-        want_tokens = _name_tokens(_clean_case_name(citation))
+        want_tokens = _case_name_tokens(citation)
 
         juris_ok: List[dict] = []
         for r in results:
@@ -1989,7 +2221,7 @@ class CLResolver:
         return None
 
     def _rank_name_candidates(self, results: List[dict], citation: Citation) -> List[dict]:
-        """Ranked jurisdiction-matching name candidates (Brazda class).
+        """Ranked jurisdiction-matching name candidates (Doe class).
 
         Same acceptance criteria as _pick_best_result's name-overlap step
         (>=2 shared distinctive tokens covering a majority of the cited
@@ -1998,7 +2230,7 @@ class CLResolver:
         'published cite not indexed' shape -- so near-duplicate clusters of
         the SAME case can be walked for the substantive published opinion.
         """
-        want_tokens = _name_tokens(_clean_case_name(citation))
+        want_tokens = _case_name_tokens(citation)
         if not want_tokens:
             return []
         need = 2 if len(want_tokens) >= 2 else 1
@@ -2210,6 +2442,10 @@ class CLResolver:
         and returns the first that yields real opinion text, with provenance, or
         None when none resolve."""
         for source, url in fallback_candidates(citation):
+            if source in ("txcourts_case_page", "txcourts_bc_index"):
+                # Session E: navigation hints for the agent-driven gap loop,
+                # never opinion bodies -- skip in the automated fetch path.
+                continue
             try:
                 text = fetcher(url)
             except Exception:

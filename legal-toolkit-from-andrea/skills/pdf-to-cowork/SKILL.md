@@ -14,11 +14,7 @@ description: >
   extraction tool only.
 ---
 
-> **Version:** v1.0.0 (shared edition) · Part of the legal-filing-toolkit plugin.
-> Converts PDFs to Markdown/plain text the assistant can Read and Grep natively.
-> Runs entirely in the Linux shell sandbox, so it has no host-OS (Windows/macOS/
-> Linux) dependency and never uses PowerShell. See `environment-setup` for
-> OS/path configuration.
+> **Version:** v2026.07.29-1 (shared edition) · **Last updated:** 2026.08.05
 
 # PDF → Cowork Converter
 
@@ -183,10 +179,10 @@ directory as the source PDF:
 
 ```
 Documents/Matters/Example Matter/Court Papers/
-├── 2025-08-08 Respondents Motion to DQ.pdf
+├── 2025-08-08 Motion to Dismiss.pdf
 ├── Guaranty Agreement.pdf
 ├── _cowork_txt/
-│   ├── 2025-08-08 Respondents Motion to DQ_COWORK.md
+│   ├── 2025-08-08 Motion to Dismiss_COWORK.md
 │   ├── Guaranty Agreement_COWORK.md
 │   └── MANIFEST.md
 ```
@@ -294,8 +290,8 @@ italic, caption blocks) require PyMuPDF.
 
 If bash itself is unavailable (returns "Workspace still starting" or
 "Workspace unavailable" after 3 retries with 10-second waits), STOP.
-Report to the user that the conversion requires the shell sandbox and it's
-currently down. Do NOT attempt to manually transcribe from the Read tool as a
+Report to the user that the conversion requires bash and it's currently
+down. Do NOT attempt to manually transcribe from the Read tool as a
 workaround — that produces non-verbatim output and defeats the purpose.
 
 ### Step 1: Locate the script

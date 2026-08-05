@@ -70,6 +70,230 @@ DROPCAP_SIZE_RATIO = 0.75      # Small-cap letter must be <= this ratio of the i
 NATIVE_TXT_MIN_CHARS = 20  # sidecars shorter than this are treated as empty
 
 
+# ── Duplicate text-layer dedup ─────────────────────────────────────────────────
+# Some PDFs (e.g. a scanned brief re-saved with an OCR text layer over the
+# original export layer) carry TWO overlapping text layers. PyMuPDF get_text()
+# and pdftotext both extract BOTH copies, so every page appears twice and the
+# citation/instance count roughly doubles. We remove the duplicate two ways,
+# both font-agnostic:
+#   (1) span-font layer drop — when a page's fonts split into two groups whose
+#       words are near-identical, drop the more span-fragmented (OCR-style)
+#       group and keep the other. Runs on the PyMuPDF font metadata that drives
+#       the .md render path.
+#   (2) normalized-similarity text dedup — collapse line-level ("A A" on one
+#       row, as pdftotext -layout emits) and page-level (first-half ~ second-
+#       half) duplication in already-extracted page text. Runs on the pdftotext
+#       path (.txt output and the .md fallback) and catches doubling from any
+#       cause, not just this font pattern.
+
+from difflib import SequenceMatcher
+
+_DUPE_QUOTE_MAP = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+                   "\u201e": '"', "\u201a": "'", "\u2032": "'", "\u2033": '"',
+                   "`": "'", "\u00b4": "'"}
+_DUPE_DASH_MAP = {"\u2014": "-", "\u2013": "-", "\u2012": "-", "\u2212": "-"}
+
+
+def _dupe_fold(s: str) -> str:
+    """Normalize text for duplicate detection: fold smart quotes/dashes, strip
+    markdown emphasis, collapse whitespace, lowercase."""
+    for a, b in _DUPE_QUOTE_MAP.items():
+        s = s.replace(a, b)
+    for a, b in _DUPE_DASH_MAP.items():
+        s = s.replace(a, b)
+    s = s.replace("*", "").replace("_", "")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _dupe_richness(s: str) -> int:
+    """Higher for the 'original' layer copy: it keeps smart quotes / em dashes /
+    markdown emphasis, whereas the OCR-style duplicate uses straight ASCII."""
+    return (s.count("\u201c") + s.count("\u201d") + s.count("\u2018")
+            + s.count("\u2019") + s.count("\u2014") + s.count("\u2013")
+            + s.count("*"))
+
+
+def _token_containment(a: str, b: str) -> float:
+    """Order-independent share of a's tokens (with multiplicity) that also appear
+    in b. Containment, not Jaccard: the OCR duplicate layer's words are a SUBSET
+    of the full-page vocabulary, so containment stays high even when the original
+    layer is split across several fonts (roman + italic case names + dotted
+    leaders) or a third unrelated font (e.g. figure labels) is present."""
+    ca = Counter(_dupe_fold(a).split())
+    cb = Counter(_dupe_fold(b).split())
+    if not ca or not cb:
+        return 0.0
+    inter = sum((ca & cb).values())
+    return inter / sum(ca.values())
+
+
+_LAYER_COVERAGE = 0.25   # a duplicate layer must cover >= this share of the page
+_LAYER_CONTAIN = 0.62    # share of the OCR layer's tokens found in the other layer
+
+
+def detect_duplicate_layer_fonts(font_stats: dict) -> set:
+    """Given {font_name: {'chars': int, 'spans': int, 'text': str}} for one page,
+    return the set of font names belonging to a duplicate (OCR-style) text layer
+    that should be dropped, or an empty set if the page is not doubled.
+
+    Font-agnostic: the duplicate layer is the MOST span-fragmented font group
+    (OCR relayers emit roughly one span per word) whose words replicate the rest
+    of the page. We keep the less-fragmented group — the original export layer,
+    which carries the smart quotes and the italic/bold runs used for emphasis."""
+    total = sum(v["chars"] for v in font_stats.values())
+    if total < 60 or len(font_stats) < 2:
+        return set()
+    cands = sorted(font_stats.items(),
+                   key=lambda kv: kv[1]["spans"] / max(1, kv[1]["chars"]),
+                   reverse=True)
+    for font, info in cands:
+        if info["chars"] < total * _LAYER_COVERAGE:
+            continue
+        rest_text = "".join(v["text"] for g, v in font_stats.items() if g != font)
+        if len(_dupe_fold(rest_text)) < total * 0.20:
+            continue
+        if _token_containment(info["text"], rest_text) >= _LAYER_CONTAIN:
+            return {font}
+    return set()
+
+
+_DUPE_MIN_FOLD = 12
+_DUPE_LINE_SIM = 0.90
+_DUPE_PAGE_SIM = 0.90
+_DUPE_BLOCK_SIM = 0.90
+
+
+def _ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _dedupe_doubled_line(line: str):
+    """If one physical line is its own content repeated twice ('A A' side by
+    side, as pdftotext -layout emits for a dual text layer), return one copy;
+    else None."""
+    core = line.strip()
+    folded = _dupe_fold(core)
+    if len(folded) < _DUPE_MIN_FOLD:
+        return None
+    fw = folded.split(" ")
+    n = len(fw)
+    if n < 4:
+        return None
+    best = None
+    for m in {n // 2, (n + 1) // 2}:
+        if 0 < m < n:
+            r = _ratio(" ".join(fw[:m]), " ".join(fw[m:]))
+            if best is None or r > best[0]:
+                best = (r, m)
+    if not best or best[0] < _DUPE_LINE_SIM:
+        return None
+    raw = core.split()
+    if len(raw) != n:
+        return None
+    m = best[1]
+    first = " ".join(raw[:m]); second = " ".join(raw[m:])
+    return second if _dupe_richness(second) >= _dupe_richness(first) else first
+
+
+_DUPE_FOOTER_LINE_MAX = 45  # a footer-like line is short (page no. / doc id)
+
+
+def _dedupe_adjacent_blocks(lines: list):
+    """Collapse an immediately repeated run of SHORT footer-like lines (e.g. a
+    footer emitted twice by a dual layer: '57' / 'CORE/...' / '57' / 'CORE/...').
+    Restricted to short lines so parallel prose (string cites, list items) is
+    never collapsed. Returns (lines, changed)."""
+    out = []
+    i = 0
+    n = len(lines)
+    changed = False
+    while i < n:
+        collapsed = False
+        for L in range(min(4, (n - i) // 2), 0, -1):
+            a = lines[i:i + L]
+            b = lines[i + L:i + 2 * L]
+            # every line in both blocks must be short (footer-like)
+            if any(len(_dupe_fold(x)) > _DUPE_FOOTER_LINE_MAX for x in a + b):
+                continue
+            fa = _dupe_fold("\n".join(a)); fb = _dupe_fold("\n".join(b))
+            if len(fa) < 4:
+                continue
+            if _ratio(fa, fb) >= 0.95:
+                keep = b if _dupe_richness("\n".join(b)) >= _dupe_richness("\n".join(a)) else a
+                out.extend(keep)
+                i += 2 * L
+                collapsed = True
+                changed = True
+                break
+        if not collapsed:
+            out.append(lines[i])
+            i += 1
+    return out, changed
+
+
+def _dedupe_page_halves(lines: list):
+    """Collapse whole-page doubling where the first half ~ the second half.
+    Returns (lines, changed)."""
+    ne = [i for i, l in enumerate(lines) if l.strip()]
+    if len(ne) < 6:
+        return lines, False
+    best = None
+    lo = int(len(ne) * 0.30); hi = int(len(ne) * 0.70) + 1
+    for k in range(max(1, lo), min(len(ne) - 1, hi)):
+        s = ne[k]
+        top = _dupe_fold("\n".join(lines[:s])); bot = _dupe_fold("\n".join(lines[s:]))
+        if len(top) < _DUPE_MIN_FOLD or len(bot) < _DUPE_MIN_FOLD:
+            continue
+        r = _ratio(top, bot)
+        if best is None or r > best[0]:
+            best = (r, s)
+    if best and best[0] >= _DUPE_PAGE_SIM:
+        s = best[1]
+        top = lines[:s]; bot = lines[s:]
+        keep = bot if _dupe_richness("\n".join(bot)) >= _dupe_richness("\n".join(top)) else top
+        return keep, True
+    return lines, False
+
+
+def dedupe_page_text(text: str):
+    """Remove line-level and page-level text-layer duplication from one page's
+    text. Returns (deduped_text, changed_bool). No-op on non-doubled pages."""
+    lines = text.split("\n")
+    changed = False
+    p0 = []
+    for ln in lines:
+        d = _dedupe_doubled_line(ln)
+        if d is not None:
+            indent = ln[:len(ln) - len(ln.lstrip())] if ln.strip() else ""
+            p0.append(indent + d)
+            changed = True
+        else:
+            p0.append(ln)
+    lines = p0
+    lines, c1 = _dedupe_adjacent_blocks(lines); changed = changed or c1
+    lines, c2 = _dedupe_page_halves(lines); changed = changed or c2
+    lines, c3 = _dedupe_adjacent_blocks(lines); changed = changed or c3
+    return "\n".join(lines), changed
+
+
+def page_doubling_fraction(page_texts: list) -> float:
+    """Fraction of pages whose text is internally near-duplicated by a
+    SUBSTANTIAL amount (>25% of the page's characters collapse away). The
+    substantial-removal test avoids counting a page merely because a short
+    doubled footer collapsed. Used by the cite-check doubling gate."""
+    if not page_texts:
+        return 0.0
+    doubled = 0
+    for t in page_texts:
+        stripped = t.strip()
+        if len(stripped) < 200:
+            continue
+        new, changed = dedupe_page_text(t)
+        if changed and (len(stripped) - len(new.strip())) >= 0.25 * len(stripped):
+            doubled += 1
+    return doubled / len(page_texts)
+
+
 def find_native_txt_sidecar(pdf_path: Path):
     """Return (path, text) of a sibling native-text sidecar, or (None, None).
 
@@ -273,15 +497,42 @@ def extract_font_metadata(pdf_path: Path) -> dict:
     page_width = doc[0].rect.width if doc.page_count > 0 else 612
     page_height = doc[0].rect.height if doc.page_count > 0 else 792
 
-    # First pass: determine body font/size
-    font_counter = Counter()
+    # Pre-pass: per page, detect a duplicate (OCR-style) text layer to drop.
+    page_drop_fonts = []
+    doubled_layer_pages = 0
     for page in doc:
+        fstats = {}
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    fn = span.get("font", "")
+                    d = fstats.setdefault(fn, {"chars": 0, "spans": 0, "text": ""})
+                    txt = span.get("text", "")
+                    d["chars"] += len(txt)
+                    d["spans"] += 1
+                    d["text"] += txt + " "
+        drop = detect_duplicate_layer_fonts(fstats)
+        page_drop_fonts.append(drop)
+        if drop:
+            doubled_layer_pages += 1
+    if doubled_layer_pages:
+        print(f"    duplicate text layer on {doubled_layer_pages}/{doc.page_count} "
+              f"page(s) — dropping the OCR-style copy", flush=True)
+
+    # First pass: determine body font/size (ignoring any dropped layer)
+    font_counter = Counter()
+    for page_idx, page in enumerate(doc):
+        drop = page_drop_fonts[page_idx]
         blocks = page.get_text("dict")["blocks"]
         for block in blocks:
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
+                    if span.get("font", "") in drop:
+                        continue
                     text = span.get("text", "").strip()
                     if not text:
                         continue
@@ -310,7 +561,8 @@ def extract_font_metadata(pdf_path: Path) -> dict:
 
             for line in block.get("lines", []):
                 line_bbox = line.get("bbox", block_bbox)
-                spans = line.get("spans", [])
+                drop = page_drop_fonts[page_idx]
+                spans = [s for s in line.get("spans", []) if s.get("font", "") not in drop]
                 if not spans:
                     continue
 
@@ -1331,6 +1583,18 @@ def convert_pdf(
         try:
             print(f"  Trying {method_name}...", end=" ", flush=True)
             pages, gaps = func(pdf_path)
+
+            # Remove duplicate text-layer doubling from the extracted text.
+            # (pdftotext -layout emits both layers on each row; this also cleans
+            #  the .txt path and the .md fallback.) No-op on non-doubled pages.
+            _dbl = 0
+            for _pi in range(len(pages)):
+                _new, _ch = dedupe_page_text(pages[_pi])
+                if _ch:
+                    pages[_pi] = _new
+                    _dbl += 1
+            if _dbl:
+                print(f"[text-layer dedup: {_dbl} pg]", end=" ", flush=True)
 
             # Validate
             validation = validate_extraction(pages, gaps, true_page_count)

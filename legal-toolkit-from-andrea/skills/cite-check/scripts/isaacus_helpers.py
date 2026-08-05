@@ -415,7 +415,7 @@ def to_markdown(
     The library wraps the enricher; one API call per document.  Returns
     the Markdown string, or None on failure.
 
-    Defaults chosen for the author's workflow:
+    Defaults chosen for the attorney's workflow:
         * link_xrefs=True       -- turn "see section 3" into anchor links
         * italicize_refs=True   -- italicize case citations
         * italicize_terms=True  -- italicize defined terms

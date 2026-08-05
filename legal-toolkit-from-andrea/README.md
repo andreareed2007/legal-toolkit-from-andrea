@@ -48,7 +48,8 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
 - **cite-check** — the full verification pipeline for briefs: eyecite citation
   detection, batched CourtListener resolution with identity gates, a bounded
   free-source gap loop, Isaacus AI proposition verification, quote-fidelity
-  grading, good-law treatment signals, and a five-tier severity report (HTML,
+  grading, good-law treatment signals, an application-sentence layer, and a
+  five-tier severity report (HTML,
   .docx, or .txt). Needs CourtListener + Isaacus API keys (see First run).
   The author's regression fixtures (built from real briefs) are not included;
   validate changes against a brief you know.

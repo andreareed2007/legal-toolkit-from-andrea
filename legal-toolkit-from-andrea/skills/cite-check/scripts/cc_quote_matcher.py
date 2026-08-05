@@ -2,15 +2,15 @@
 
 v1 (2026.07.09) was adapted from rlfordon/citation-verifier quote_matcher.py
 (MIT license, Rebecca Fordon). v2 (2026.07.14) rewrote the matching core for
-the report redesign. v3 (Phase 8, 2026.07.15, the author's QA of the Phase 7
-QA-Brief report) fixes the permitted-alteration path and adds display support:
+the report redesign. v3 (Phase 8, 2026.07.15, the attorney's QA of the Phase 7
+Brief C report) fixes the permitted-alteration path and adds display support:
 
 * Bracketed SUBSTITUTIONS of any length ([judgment creditor] for "relator")
   are wildcards on the segment path; single-letter brackets that fold badly
   (part[y] for "parties") get a second, split-at-the-bracket pass. Segment
   edges are stripped of punctuation, so a quote that ends mid-sentence (the
   brief's closing period where the opinion sentence continues) still
-  matches. QA-Brief cits 11 and 15.
+  matches. Brief C cits 11 and 15.
 * Dash folding: em/en dashes and the Windows-1252 \\x96/\\x97 bytes fold to a
   space on BOTH sides (the opinion's "Malones\\x97the" vs the brief's
   em-dash broke cit 15).
@@ -166,9 +166,9 @@ def _segments(raw_needle: str, split_single: bool = False):
     split_single=False folds single-letter case alterations ([T]he) into the
     neighboring text; split_single=True treats them as separators too -- the
     part[y]-for-"parties" class, where the folded word ("party") appears
-    nowhere in the opinion (Phase 8, QA-Brief cit 15). Segment edges are
+    nowhere in the opinion (Phase 8, Brief C cit 15). Segment edges are
     stripped of punctuation so the brief's closing period never has to match
-    a mid-sentence opinion (QA-Brief cit 11)."""
+    a mid-sentence opinion (Brief C cit 11)."""
     s = raw_needle
     for k, v in _QUOTE_FOLD.items():
         s = s.replace(k, v)
@@ -536,7 +536,7 @@ def verify_quote(quote: str, opinion_text: str, *, was_ocrd: bool = False,
         window = _window_from_raw(raw_hay, idxmap, start,
                                   wl + max(40, wl // 4))
         diff = quote_diff(raw_needle, window)
-        # author 2026.07.15 (QA-Brief cits 16 & 10): a CLOSE result is a MISQUOTE
+        # the attorney 2026.07.15 (Brief C cits 16 & 10): a CLOSE result is a MISQUOTE
         # unless every literal run between brackets/ellipses still appears in
         # order in the FULL opinion -- i.e. the only differences are bracket
         # substitutions and clean ellipsis omissions. A word dropped or

@@ -40,6 +40,85 @@ from eyecite.models import (
 # Quote long enough to be a "direct quote" for the id. rule.
 _ID_QUOTE_RE = re.compile('["\u201c\u201d\u201e\u201f\u00ab]''[^"\u201c\u201d\u201e\u201f\u00bb]{15,}''["\u201c\u201d\u201e\u201f\u00bb]')
 
+# --- Record-material id. guards (2026.08.04, v16 false-CRITICAL fix) -------
+# An "Id." that points at RECORD material (exhibit, pleading, deposition
+# transcript, appendix, docket entry) is not a case citation and must never
+# enter the case pipeline -- the v16 run graded a deposition quote against
+# the neighboring case's opinion and branded it FABRICATED (a deposition exhibit
+# "Id. at 28:21-23" -> Bolle), and sent an exhibit id. ("Id. at 12
+# \u00b6\u00b6 49-50, Apx. __") to the resolver, which dragged in a random
+# wrong-case caption. Two independent tells, either drops the id.:
+#   (a) the id.'s own pincite/tail carries a record fingerprint -- a
+#       paragraph cite (\u00b6), a transcript page:line ("28:21-23"), or an
+#       appendix/exhibit marker;
+#   (b) a record cite intervenes between the id. and the nearest preceding
+#       case-ish cite: Bluebook id. refers to the IMMEDIATELY preceding
+#       cite, which eyecite cannot see when it is record material, so the
+#       chain must not silently skip over it to a case.
+_RECORD_PIN_RE = re.compile(
+    "\u00b6"
+    "|\\b\\d+:\\d+(?:-\\d+)?\\b"
+    "|\\bApx\\b|\\bApp'x\\b|\\bAppx\\b")
+_RECORD_TAIL_RE = re.compile(
+    "^[\\s,.;]*(?:at\\s+\\d+\\s*\u00b6|\u00b6|\u00a7"
+    "|(?:Ex|Exs|Apx|Tr|Dkt|ECF)\\.?[\\s\\d])")
+_RECORD_MARK_RE = re.compile(
+    "\\b(?:Ex|Exs)\\.\\s|\\bApx\\.|\\bApp'x\\b|\\bAppx\\."
+    "|\\bDep\\.(?:\\s|$)|\\bTr\\.\\s|\\bDkt\\.|\\bECF\\b"
+    "|\\bR\\.\\s+at\\s|\\bCR\\s+at\\s|\\bRR\\s+at\\s")
+_CASEISH_RE = re.compile(
+    "\\sv\\.\\s|\\bIn re\\b|\\bMatter of\\b|\\bEx parte\\b"
+    "|\\b\\d+\\s+[A-Z][\\w.]*\\.?(?:\\s?(?:2d|3d|4th|5th))?\\s+\\d+")
+
+
+def _id_is_record(text, span_start, span_end, pin_cite):
+    """True when an IdCitation points at record material (see above)."""
+    probe = (pin_cite or "") + " " + text[span_end:span_end + 40]
+    if _RECORD_PIN_RE.search(probe):
+        return True
+    if _RECORD_TAIL_RE.match(text[span_end:span_end + 40]):
+        return True
+    back = text[max(0, span_start - 260):span_start]
+    last = None
+    for last in _RECORD_MARK_RE.finditer(back):
+        pass
+    if last is not None and not _CASEISH_RE.search(back[last.end():]):
+        return True
+    return False
+
+
+# --- Prose-antecedent name harvest (2026.08.04, Williams-short fix) --------
+# A short form or id. whose antecedent is named only in PROSE ("In Williams
+# v. Glash, the Supreme Court outlined ..." ... "789 S.W.2d at 265") gets no
+# antecedent_guess from eyecite, so its "name" degraded to the cite string
+# and the resolver's caption check rejected its own correct lookup hit. The
+# harvested name is only a HINT: the resolver's caption + cite-address
+# identity gates still validate it, so a wrong harvest degrades to today's
+# behavior, never worse.
+_NONNAME_RE = re.compile("^(?:id|supra|ante)\\.?$|^\\d+\\s+\\S+", re.I)
+_PROSE_NAME_RE = re.compile(
+    "((?:In re|Matter of|Ex parte)\\s+[A-Z][\\w.'\u2019&-]*"
+    "(?:\\s+[A-Z][\\w.'\u2019&-]*){0,4}"
+    "|[A-Z][\\w.'\u2019&-]*(?:\\s+[A-Z][\\w.'\u2019&-]*){0,4}"
+    "\\s+v\\.\\s+[A-Z][\\w.'\u2019&-]*(?:\\s+[A-Z][\\w.'\u2019&-]*){0,4})")
+
+
+def _prose_antecedent(text, start):
+    """Nearest preceding prose case name within ~320 chars, or ''."""
+    back = text[max(0, start - 320):start]
+    last = None
+    for last in _PROSE_NAME_RE.finditer(back):
+        pass
+    if last is None:
+        return ""
+    nm = last.group(1).strip(" ,")
+    # "In Williams v. Glash, the Court ..." -- the "In" is prose framing,
+    # not part of the case name (but "In re X" keeps its "In").
+    if nm.startswith("In ") and not nm.startswith("In re"):
+        nm = nm[3:]
+    return nm
+
+
 # Extend cite_text past the reporter core over an immediate pincite and the
 # (Court Year) parenthetical, as written in the brief.
 _CITE_TAIL_RE = re.compile(r"^(?:,\s*(?:at\s+)?[*¶]?\d[\w\s.,*¶&-]{0,38}|\s*[*¶]?\d[\w,*¶-]{0,12})?(?:\s*\([^()]{0,70}\))?")
@@ -71,7 +150,7 @@ def _prev_sentence(text: str, pos: int) -> str:
 
     Used by the id.-folding guard: a footnote that merely drops a bare
     cite ("Id. at 704") in support of a quotation carried in the BODY
-    sentence puts the quote one sentence back from the cite (QA-Brief
+    sentence puts the quote one sentence back from the cite (Brief C
     magic-wand miss, 2026.07.13).
     """
     try:
@@ -154,8 +233,15 @@ def detect(text: str) -> dict:
         if isinstance(c, FullCaseCitation):
             full = c
 
+        id_unresolved_review = False
         if isinstance(c, IdCitation):
-            # Locked spec #6 (amended 2026.07.13, QA-Brief magic-wand miss):
+            # Record-material guard (2026.08.04): a record id. is dropped
+            # BEFORE the quote logic -- resolved or not, a deposition or
+            # exhibit id. must never be graded against a case opinion.
+            if _id_is_record(text, c.span()[0], c.span()[1],
+                             getattr(c.metadata, "pin_cite", "") or ""):
+                continue
+            # Locked spec #6 (amended 2026.07.13, Brief C magic-wand miss):
             # an id. folds into the preceding cite -- UNLESS a direct
             # quotation sits in its own sentence OR in the immediately
             # preceding sentence. The preceding-sentence arm catches the
@@ -164,8 +250,6 @@ def detect(text: str) -> dict:
             # "Id. at NNN", often at a DISTINCT page from its antecedent,
             # so it can support a DISTINCT proposition and must not be
             # silently dropped. Quote detector is curly-quote aware.
-            if full is None:
-                continue
             _own = _sentence_around(text, c.span()[0])
             _prev = _prev_sentence(text, c.span()[0])
             # American-style punctuation puts the period INSIDE the
@@ -173,8 +257,26 @@ def detect(text: str) -> dict:
             # quotation across the prev/own boundary (the closing quote
             # lands alone in the id.'s sentence). Search the JOINED
             # window so a boundary-split quote still registers.
-            if not _ID_QUOTE_RE.search(_prev + " " + _own):
+            _has_quote = bool(_ID_QUOTE_RE.search(_prev + " " + _own))
+            if not _has_quote:
+                # No direct quote in scope -> id. folds into its antecedent
+                # (adds nothing separately checkable), resolved or not.
                 continue
+            if full is None:
+                # Fix 4 (Finding 2/B1): the id. chain broke (no resolved
+                # antecedent), but its sentence carries a direct quotation
+                # that MUST be checked. Rather than silently drop it (the old
+                # `if full is None: continue` bug that lost the 3rd MacFarland
+                # quote), attach it to the nearest preceding instance's
+                # authority and flag it review-required. GUARD: an id. that
+                # points to a STATUTE/CONTRACT section ("id. § 12.1(c)") or an
+                # EXHIBIT/record ("id., Ex. F") is not a case citation -- do
+                # not rescue it as one (it would grade a contract/record quote
+                # against the neighboring case's opinion).
+                _tail = text[c.span()[1]:c.span()[1] + 10].lstrip()
+                if _tail[:1] == "§" or re.match(r"(?:Ex|App|Tr|R|CR|RR)\.", _tail):
+                    continue
+                id_unresolved_review = True
         elif isinstance(c, SupraCitation):
             # Bare supra (no pincite) adds nothing checkable; folds.
             if full is None or not _pin_norm(c.metadata.pin_cite):
@@ -197,6 +299,15 @@ def detect(text: str) -> dict:
                 name = _name_from_full(gf)
         if not name and not isinstance(c, FullCaseCitation):
             name = (getattr(c.metadata, "antecedent_guess", "") or "").strip(" ,")
+        if ((not name or _NONNAME_RE.match(name))
+                and isinstance(c, (ShortCaseCitation, IdCitation,
+                                   SupraCitation))):
+            # 2026.08.04: recover the case name from preceding prose when
+            # eyecite's antecedent guess came up empty (identity gates
+            # downstream validate the harvested name).
+            _pn = _prose_antecedent(text, c.span()[0])
+            if _pn:
+                name = _pn
         if not name:
             name = c.matched_text()
 
@@ -216,7 +327,14 @@ def detect(text: str) -> dict:
 
         s0, s1 = c.span()
         rkey = id(full) if full is not None else id(c)
-        per_resource_counts[rkey] = per_resource_counts.get(rkey, 0) + 1
+        if id_unresolved_review and instances:
+            # Inherit the nearest preceding instance's authority so the
+            # rescued id-with-quote groups with, and is graded against, that
+            # authority (Bluebook: an id. refers back to the preceding cite).
+            _prev_inst = instances[-1]
+            name = _prev_inst["name"] or name
+            rc = _prev_inst["reporter_cite"] if rc is None else rc
+            rkey = _prev_inst["_rkey"]
         instances.append({
             "name": name,
             "cite_text": _cite_text(text, c),
@@ -227,6 +345,7 @@ def detect(text: str) -> dict:
             "pincite": _pin_norm(pin_raw),
             "is_short_form": not isinstance(c, FullCaseCitation),
             "kind": type(c).__name__,
+            "id_unresolved_review": id_unresolved_review,
             "_rkey": rkey,
         })
 
@@ -260,7 +379,34 @@ def detect(text: str) -> dict:
         inst["nested_parenthetical"] = opener_m.group(1).lower()
         inst["parent_span_start"] = instances[parent]["span_start"]
 
-    # occurrence_index / occurrence_count per resolved authority
+    # Fix 5 (Finding 3/C2-C3): Id-antecedent correction under Bluebook R4.1.
+    # eyecite chains an Id. to the immediately preceding cite even when that
+    # cite sits inside a "(quoting/citing ...)" parenthetical; sources cited
+    # within explanatory parentheticals are ignored for id. purposes. When the
+    # instance directly before an Id. is marked nested_parenthetical, re-point
+    # the Id. to that parenthetical's PARENT authority (e.g., cards 180/185:
+    # Marcus & Millichap, not the inner Valdez).
+    _span2inst = {inst["span_start"]: inst for inst in instances}
+    for k in range(1, len(instances)):
+        inst = instances[k]
+        if inst.get("kind") != "IdCitation":
+            continue
+        prev = instances[k - 1]
+        if not prev.get("nested_parenthetical"):
+            continue
+        parent = _span2inst.get(prev.get("parent_span_start"))
+        if parent is None:
+            continue
+        inst["name"] = parent["name"]
+        inst["reporter_cite"] = parent["reporter_cite"]
+        inst["_rkey"] = parent["_rkey"]
+        inst["_id_antecedent_corrected"] = True
+
+    # occurrence_index / occurrence_count per resolved authority (rebuilt after
+    # fixes 4-5 may have re-pointed some instances' authority keys)
+    per_resource_counts = {}
+    for inst in instances:
+        per_resource_counts[inst["_rkey"]] = per_resource_counts.get(inst["_rkey"], 0) + 1
     seen: dict = {}
     for inst in instances:
         k = inst.pop("_rkey")

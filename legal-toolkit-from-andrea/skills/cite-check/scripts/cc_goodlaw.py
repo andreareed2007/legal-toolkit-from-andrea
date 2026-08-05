@@ -1,7 +1,7 @@
 """cc_goodlaw.py -- treatment-signal engine (good-law evidence pass).
 
 Additive companion to the cite-check pipeline (2026.07.06 design doc, signed
-off by author: summary section + per-card flags, N=10, uniform depth). Runs
+off by the attorney: summary section + per-card flags, N=10, uniform depth). Runs
 AFTER phase2, renders as a separate Treatment axis -- verify() semantics and
 the 11-verdict taxonomy are untouched.
 
@@ -29,7 +29,7 @@ import cl_resolver as _clr
 from cl_resolver import BASE_URL, CLResolver, make_opinion_url
 
 LEXICON_VERSION = 1
-N_DEFAULT = 10          # citing opinions scanned per authority (author, 2026.07.06)
+N_DEFAULT = 10          # citing opinions scanned per authority (the attorney, 2026.07.06)
 WINDOW = 250            # chars each side of a mention that a verb may sit in
 CAUTION_CONFIRM_CAP = 3  # max text fetches spent confirming caution-only hits
 NEGATIVE_WEIGHT = 80    # court weight at/above which a strong verb is NEGATIVE
@@ -63,7 +63,14 @@ _NEGATION_RE = re.compile(
 # Courts overrule OBJECTIONS and motions; that is a procedural ruling, not
 # case treatment (the Anderson control false positive, 2026.07.06).
 _PROCEDURAL_RE = re.compile(
-    r"\b(?:objections?|motions?|demurrers?|pleas?|exceptions?)\b", re.I)
+    r"\b(?:objections?|motions?|demurrers?|pleas?|exceptions?"
+    # 2026.08.04 (v16 Cit 7 junk CAUTION): Texas appellate boilerplate
+    # disposes of ISSUES and POINTS OF ERROR by "overruling" them in nearly
+    # every memorandum opinion ("Drew's fourth issue is overruled") -- a
+    # ruling on the CITING case's own appellate issues, never treatment of
+    # the cited authority.
+    r"|issues?|points?\s+of\s+error|complaints?|grounds?"
+    r"|motion\s+for\s+rehearing)\b", re.I)
 
 _STRONG_QUERY = ('("overruled" OR "abrogated" OR "disapproved" OR '
                  '"superseded by statute" OR "no longer good law" OR '
@@ -175,8 +182,13 @@ def scan_text(text: str, toks: list, cite_res: list) -> list:
                 vpos = m.start()
                 if cls == "strong" and _NEGATION_RE.search(text[max(0, vpos - 60):vpos]):
                     continue
-                if _PROCEDURAL_RE.search(text[max(0, vpos - 45):m.end() + 45]):
-                    continue  # "objections overruled" -- ruling, not treatment
+                # 2026.08.04: look-back widened 45 -> 120. Texas
+                # appellate boilerplate lists the issues well before the
+                # verb ("Appellant's fourth and seventh issues as to his
+                # civil conspiracy claim ... are overruled"), which the
+                # 45-char window missed (Massey false CAUTION, v16 v2).
+                if _PROCEDURAL_RE.search(text[max(0, vpos - 120):m.end() + 45]):
+                    continue  # "objections/issues overruled" -- ruling, not treatment
                 best = None
                 for ms, me in mentions:
                     d = 0 if ms <= vpos <= me else min(abs(vpos - me), abs(ms - m.end()))

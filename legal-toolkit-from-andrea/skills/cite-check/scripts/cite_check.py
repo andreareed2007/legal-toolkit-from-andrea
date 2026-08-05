@@ -35,6 +35,94 @@ import isaacus_chunker as chunker_mod
 import cc_proposition as ccprop   # consolidated reporter-agnostic extractor
 import cc_detect_eyecite as cc_detect  # eyecite detection backbone (Phase 1, 2026.07.03)
 import cc_quote_matcher  # graded quote fidelity (Part 3, 2026.07.09, from rlfordon/citation-verifier, MIT)
+import cc_application  # application-sentence detector (2026.08.04, locked design)
+
+
+# --------------------------------------------------------------------------
+# Input doubling gate (2026.07.29, Session B)
+# --------------------------------------------------------------------------
+# Some source PDFs carry a duplicate text layer (an OCR-style copy over the
+# original export layer). Both copies get extracted, so every page appears
+# twice and the citation/instance count roughly doubles -- burning the
+# resolve/gap budget, producing false "duplicate" cards, and crossing id-chains
+# between copies (Brief D diagnosis, Finding 0). The converter
+# (pdf-to-cowork-txt v2026.07.29+) now drops the duplicate layer, but this gate
+# is the belt-and-suspenders: if a doubled document reaches build from ANY
+# source, refuse rather than emit a corrupt report.
+from difflib import SequenceMatcher as _DblSM
+
+_DBL_QUOTE_MAP = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+                  "\u201e": '"', "\u201a": "'", "`": "'", "\u00b4": "'"}
+_DBL_DASH_MAP = {"\u2014": "-", "\u2013": "-", "\u2212": "-", "\u2012": "-"}
+_DOUBLING_REFUSE_THRESHOLD = 0.10   # refuse if >10% of page blocks are doubled
+
+
+class DoubledInputError(Exception):
+    """Raised when the brief text is page-doubled (duplicate text layer)."""
+
+
+def _dbl_fold(text: str) -> str:
+    for a, b in _DBL_QUOTE_MAP.items():
+        text = text.replace(a, b)
+    for a, b in _DBL_DASH_MAP.items():
+        text = text.replace(a, b)
+    text = text.replace("*", "").replace("_", "")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _dbl_block_is_doubled(block: str) -> bool:
+    """True if one page/block's text is substantially internally duplicated,
+    either line-level ('A A' on one row) or page-level (first half ~ second
+    half)."""
+    if len(block.strip()) < 200:
+        return False
+    lines = block.split("\n")
+
+    def _line_doubled(ln: str) -> bool:
+        folded = _dbl_fold(ln)
+        if len(folded) < 20:
+            return False
+        w = folded.split(" ")
+        n = len(w)
+        if n < 6:
+            return False
+        m = n // 2
+        return _DblSM(None, " ".join(w[:m]), " ".join(w[m:])).ratio() >= 0.90
+
+    long_lines = [l for l in lines if len(_dbl_fold(l)) >= 20]
+    if long_lines:
+        frac = sum(1 for l in long_lines if _line_doubled(l)) / len(long_lines)
+        if frac >= 0.40:
+            return True
+    ne = [i for i, l in enumerate(lines) if l.strip()]
+    if len(ne) >= 6:
+        best = 0.0
+        lo = max(1, int(len(ne) * 0.35)); hi = min(len(ne) - 1, int(len(ne) * 0.65) + 1)
+        for k in range(lo, hi):
+            sidx = ne[k]
+            top = _dbl_fold("\n".join(lines[:sidx])); bot = _dbl_fold("\n".join(lines[sidx:]))
+            if len(top) < 50 or len(bot) < 50:
+                continue
+            r = _DblSM(None, top, bot).ratio()
+            if r > best:
+                best = r
+        if best >= 0.85:
+            return True
+    return False
+
+
+def detect_input_doubling(text: str) -> float:
+    """Fraction of page blocks that are internally near-duplicated. Splits on
+    the converter's page markers (<!-- Page N of M --> or === PAGE N of M ===);
+    falls back to blank-line-delimited blocks when no markers are present."""
+    blocks = re.split(r"<!--\s*Page \d+ of \d+\s*-->|=== PAGE \d+ of \d+ ===", text)
+    blocks = [b for b in blocks if len(b.strip()) >= 200]
+    if len(blocks) < 3:
+        blocks = [b for b in re.split(r"\n\s*\n", text) if len(b.strip()) >= 200]
+    if not blocks:
+        return 0.0
+    doubled = sum(1 for b in blocks if _dbl_block_is_doubled(b))
+    return doubled / len(blocks)
 
 
 # --------------------------------------------------------------------------
@@ -54,6 +142,10 @@ class Citation:
     # cite with no recoverable governing assertion).  The report renders a
     # "review required" note instead of a blank.  Set in run() after refinement.
     proposition_review: bool = False
+    # Application-sentence build (2026.08.04): structural kind of the
+    # extracted proposition (cc_proposition extract() "kind").  The detector
+    # exempts parenthetical kinds -- they describe the CITED case.
+    prop_kind: str = "host"
     raw: dict = field(default_factory=dict)
     # TOA enrichment.  Populated by _to_citation() when the body name fuzzy-
     # matches an entry in the parsed Table of Authorities.  Shape:
@@ -74,6 +166,15 @@ class Citation:
     # distinguish/reject treatment -- a low support score is then EXPECTED.
     adverse_signal: bool = False
     adverse_signal_token: str = ""
+    # Fix 9 (Finding 5): True when this instance is a string-cite member
+    # ("see also X") whose sentence carries a quotation placed with a
+    # DIFFERENT authority. Such an instance is graded for support only and
+    # is never branded FABRICATED for another authority's quote.
+    quote_support_only: bool = False
+    # B4 (2026.07.29): True when this instance's quoted span is nested inside a
+    # "(quoting/citing X)" parenthetical -- graded support-only, never
+    # fabricated against the citing case.
+    quote_nested_attribution: bool = False
 
 
 @dataclass
@@ -195,6 +296,25 @@ FallbackResolve = Callable[[Citation], Optional[dict]]
 # --------------------------------------------------------------------------
 _VERBATIM_QUOTE_RE = re.compile(r'[\u201c"]([^\u201d"]{25,400})[\u201d"]')
 
+_BACKTICK_QUOTE_RE = re.compile(r"`([^`\u2019']{2,400})['\u2019`]")
+
+def _paired_quote_spans(proposition):
+    """Pair quote marks in DOCUMENT ORDER (mark 0 opens, mark 1 closes, ...),
+    so a closing mark pairs with ITS OWN opener -- never with the next
+    quotation's opener.  Returns quoted spans (any length) in brief order.
+    Shared by every quote extractor.  The old 25-400-char regex paired quote
+    1's CLOSER with quote 2's OPENER and captured the unquoted connective
+    between two short quotations (card 58's garbled quote; the bogus 139/146
+    MISQUOTE).  Curly directionality is honored because marks are consumed
+    left to right; the >=25-char floor is applied by callers to GRADING, not
+    to pairing."""
+    txt = proposition or ""
+    marks = [i for i, ch in enumerate(txt) if ch in ('"', '“', '”')]
+    spans = []
+    for a, b in zip(marks[0::2], marks[1::2]):
+        spans.append(txt[a + 1:b].strip())
+    return spans
+
 
 def _normalize_quote(s):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())).strip()
@@ -208,22 +328,21 @@ def _quotes_unbalanced(s):
     lacks a closer (the truncated-proposition / magic-wand class). The dangling
     fallback below must fire ONLY here; a BALANCED short quote (e.g. \"gap[]\")
     otherwise makes the fallback grab the tail after the closing mark as if it
-    were a fresh opener (2026.07.14, QA-Brief Cit 17 false-fabrication)."""
+    were a fresh opener (2026.07.14, Brief C Cit 17 false-fabrication)."""
     return (s.count('"') + s.count('\u201c') + s.count('\u201d')) % 2 == 1
 
 
 def extract_verbatim_quote(proposition):
     """Longest quoted span (>=25 chars) in a citing proposition, or ''."""
     best = ""
-    for m in _VERBATIM_QUOTE_RE.finditer(proposition or ""):
-        q = m.group(1).strip()
-        if len(q) > len(best):
+    for q in _paired_quote_spans(proposition):
+        if len(q) >= 25 and len(q) > len(best):
             best = q
     if best:
         return best
     if not _quotes_unbalanced((proposition or "").strip()):
         return best
-    # Fallback (2026.07.13, QA-Brief magic-wand): a proposition truncated at a
+    # Fallback (2026.07.13, Brief C magic-wand): a proposition truncated at a
     # sentence break can carry an OPENING quote with no closing mark --
     # American-style punctuation puts the period INSIDE the quote, so
     # sentence segmentation drops the closing mark into the next sentence.
@@ -243,10 +362,8 @@ def extract_verbatim_quotes(proposition):
     G3 (2026.07.14): the legacy extract_verbatim_quote() returned only the
     LONGEST span, so a fabricated second quotation next to a genuine longer
     one was never checked. Falls back to the dangling-tail recovery when no
-    closed span exists (the QA-Brief magic-wand class)."""
-    spans = [m.group(1).strip()
-             for m in _VERBATIM_QUOTE_RE.finditer(proposition or "")]
-    spans = [s for s in spans if len(s) >= 25]
+    closed span exists (the Brief C magic-wand class)."""
+    spans = [q for q in _paired_quote_spans(proposition) if len(q) >= 25]
     if not spans and _quotes_unbalanced((proposition or "").strip()):
         m = _DANGLING_QUOTE_RE.search((proposition or "").strip())
         if m:
@@ -266,17 +383,14 @@ def _has_quote_char(s):
 
 def extract_short_quotes(proposition):
     """BALANCED short quoted spans (1-24 chars) the >=25-char extractor
-    skips -- e.g. the "gap[]" in QA-Brief Cit 17. Quote marks are paired in
+    skips -- e.g. the "gap[]" in Brief C Cit 17. Quote marks are paired in
     document order (mark 0 opens, mark 1 closes, ...) so the connective
     BETWEEN two real quotes (e.g. the " and " joining two long quotations) is
     never captured as a short quote. Balanced pairs only, so this never grabs a
     sentence tail and the unbalanced dangling fallback stays suppressed (the
     Cit 17 guard). Requires >=2 alphanumeric chars. Deduped, brief order."""
-    s = proposition or ""
-    marks = [i for i, ch in enumerate(s) if ch in ('"', '“', '”')]
     spans = []
-    for a, b in zip(marks[0::2], marks[1::2]):
-        content = s[a + 1:b].strip()
+    for content in _paired_quote_spans(proposition):
         if (1 <= len(content) <= 24
                 and sum(c.isalnum() for c in content) >= 2
                 and content not in spans):
@@ -287,7 +401,7 @@ def extract_short_quotes(proposition):
 def recover_sentence_quotation(proposition, opinion_text, *,
                                license_signal=False):
     """Recover a whole-sentence quotation whose OPENING quote mark was dropped
-    during proposition extraction (QA-Brief Cits 2 & 5).
+    during proposition extraction (Brief C Cits 2 & 5).
 
     Fires ONLY when a positive quotation signal survives that
     extract_verbatim_quotes() could not capture -- a stray/trailing quote mark,
@@ -591,7 +705,7 @@ def _normalize_body_text(text: str) -> str:
 # at page boundaries, across page furniture ("7 A.D.3d" | page-no | FILED/NYSCEF
 # | "352, 355").  _normalize_body_text only rejoins *italic-span* breaks, so the
 # enricher never sees these cites as contiguous and silently drops them (e.g.
-# SNS Bank, Donohue, half of Beal in the Gold-Set-A gold set).  Stitch strips page
+# SNS Bank, Donohue, half of Beal in the Brief A gold set).  Stitch strips page
 # furniture + bare page numbers and joins the body into one continuous stream so
 # every citation instance is detectable.  Run AFTER the TOA is excised.
 # --------------------------------------------------------------------------
@@ -613,14 +727,14 @@ def _stitch_wrapped_lines(text: str) -> str:
     in citation-dense text -- reporter periods masked to "_", abbreviations
     everywhere -- it found NO boundary and returned multi-thousand-char
     "sentences" that swallowed many citations, giving them all the same
-    garbled proposition (Gold-Set-B [158], cites 13-20).
+    garbled proposition (Brief B [158], cites 13-20).
 
     This version keeps structure:
       * a blank line between two text lines is a PARAGRAPH break -> "\n\n";
       * a line gap that spanned page furniture / a bare page number is a PAGE
         break -- the sentence continues across it -> joined with a space, so a
         citation split across a page break stays contiguous (recovers the
-        Gold-Set-A page-split instances);
+        Brief A page-split instances);
       * an ordinary line wrap inside a paragraph is joined with a space, so a
         citation or case name split across a line wrap stays contiguous.
     Paragraph breaks survive for the segmenter; citations stay contiguous for
@@ -674,7 +788,7 @@ def _dedupe_by_span(cits: "Sequence[Citation]", window: int = 8) -> "List[Citati
     (overlapping/adjacent spans from chunk overlap).  Distinct spans are distinct
     instances and are KEPT — for a cite-check, every in-text citation is its own
     checkable item.  Replaces _dedupe_citations, which collapsed all occurrences
-    of a case to one (dropping 17 of 47 instances in the Gold-Set-A gold set).
+    of a case to one (dropping 17 of 47 instances in the Brief A gold set).
     """
     kept: List[Citation] = []
     for c in sorted(cits, key=lambda x: (x.span_start if x.span_start is not None else 0)):
@@ -955,7 +1069,9 @@ def _footnotes_for(brief: str):
     return _FOOTS_CACHE[key]
 
 
-def _extract_proposition(brief: str, start: Optional[int], end: Optional[int]) -> str:
+def _extract_proposition(brief: str, start: Optional[int], end: Optional[int],
+                         is_id: bool = False,
+                         meta: Optional[dict] = None) -> str:
     """Return the sentence containing the citation span.
 
     For footnote-style briefs, the enricher's span points into the
@@ -974,11 +1090,13 @@ def _extract_proposition(brief: str, start: Optional[int], end: Optional[int]) -
     # 2026.07.04 (footnote fix): footnote blocks are computed and PASSED --
     # extract() was silently running with foots=[] on the live path, so a
     # citation inside a brief footnote pulled a (wrong) body sentence instead
-    # of the footnote's own content (the Gold-Set-A Alliance Network card).
+    # of the footnote's own content (the Brief A Alliance Network card).
     try:
-        _r = ccprop.extract(brief, start, foots=_footnotes_for(brief))
+        _r = ccprop.extract(brief, start, foots=_footnotes_for(brief), is_id=is_id)
         _p = (_r or {}).get("proposition", "")
         if _p and not ccprop._is_bare(_p):
+            if meta is not None:
+                meta["kind"] = (_r or {}).get("kind", "host") or "host"
             return _p
     except Exception:
         logging.exception("cite_check: cc_proposition.extract failed; using legacy path")
@@ -1174,12 +1292,20 @@ def _token_overlap(a: str, b: str) -> float:
 
 # Strict TOA section delimiter -- TOA starts at the heading and ends at
 # the first body heading (Preliminary Statement, Introduction, etc.).
-_TOA_HEADING_RE = re.compile(r"\bTABLE OF AUTHORITIES\b", re.IGNORECASE)
+_TOA_HEADING_RE = re.compile(
+    r"\b(?:(?:TABLE|INDEX)\s+OF\s+(?:AUTHORITIES|CITATIONS)"
+    r"|AUTHORITIES\s+CITED)\b",
+    re.IGNORECASE,
+)
+
+# Dotted-leader page tail (e.g., "......... 27" or ". . . . passim").  Used
+# by the structural TOA fallback below when no heading text matches.
+_TOA_LEADER_TAIL_RE = re.compile(r"\.(?:\s*\.){3,}\s*(?:\d|passim)", re.IGNORECASE)
 
 # Non-adversary captions carry no " v. " (Estate of X, Matter of X, In re X,
 # Ex parte X, ...). The old " v. "/"In re"-only gate silently dropped them
 # from the TOA index, producing false "in body, not in TOA" flags -- the
-# QA-Brief as-filed run reported Estate of Brazda and Matter of QA-Brief Capital
+# Brief C as-filed run reported Estate of Doe and In re H-Corp Holdings
 # Mgmt. as body-only though both were in the brief's Table of Authorities.
 _NON_ADVERSARY_CAPTION_RE = re.compile(
     r"\b(?:In re|In the Matter of|Matter of|In the Estate of|Estate of|"
@@ -1219,7 +1345,7 @@ def _parse_toa(brief: str) -> tuple:
     # "TABLE OF AUTHORITIES" also appears in the Table of Contents (and
     # sometimes in back matter / a running footer).  Locking onto the FIRST
     # occurrence parses the TOC's dotted-leader lines and yields zero entries
-    # -- the failure that poisoned the Gold-Set-A MTD run.  Instead, try every
+    # -- the failure that poisoned the Brief A MTD run.  Instead, try every
     # occurrence and keep the block that produces the most parseable entries.
     best: dict = {}
     best_span: Optional[tuple] = None
@@ -1230,11 +1356,46 @@ def _parse_toa(brief: str) -> tuple:
         if len(idx) > len(best):
             best = idx
             best_span = (_m.start(), block_end)
+    if not best:
+        # Structural fallback: no recognizable heading matched (or the matched
+        # heading yielded 0 entries), but a Table/Index of Authorities may
+        # still be present as a dotted-leader case-name cluster near the front
+        # (garbled or missing heading text).  Re-enables name-rescue etc.
+        fb_start = _find_toa_structural_start(brief)
+        if fb_start is not None:
+            idx, block_end = _parse_toa_block(brief, fb_start)
+            if idx:
+                best = idx
+                best_span = (fb_start, block_end)
     if found and not best:
         logging.warning(
             "cite_check._parse_toa: TOA heading found but 0 entries parsed"
         )
     return best, best_span
+
+
+def _find_toa_structural_start(brief: str) -> Optional[int]:
+    """Locate a dotted-leader case-name cluster near the front of the brief
+    when no TOA/Index heading text matched.  Returns the character offset at
+    which to begin TOA-block parsing, or ``None`` if no plausible cluster is
+    found.  Conservative by design: it requires a genuine cluster of
+    dotted-leader page-tail lines, at least one of which carries a case-name
+    signal."""
+    if not brief:
+        return None
+    front = brief[: max(len(brief) // 2, 4000)]
+    leader_positions = [m.start() for m in _TOA_LEADER_TAIL_RE.finditer(front)]
+    if len(leader_positions) < 4:
+        return None
+    for pos in leader_positions:
+        line_start = brief.rfind("\n", 0, pos) + 1
+        prev_start = (brief.rfind("\n", 0, line_start - 1) + 1
+                      if line_start > 0 else 0)
+        window = brief[prev_start: pos + 1]
+        if (" v. " in window or " v " in window
+                or _NON_ADVERSARY_CAPTION_RE.search(window)):
+            return prev_start
+    return None
 
 
 def _parse_toa_block(brief: str, heading_end: int) -> tuple:
@@ -1293,7 +1454,7 @@ def _parse_toa_block(brief: str, heading_end: int) -> tuple:
         # Subsection header: flush, then skip.  Handle Markdown bold/italic
         # markers (**Cases**) and a trailing "Page(s)" / "Pages" column label
         # (e.g., "**Cases Page(s)**") so the header is recognized and does not
-        # glue onto the first authority (the Gold-Set-A "100 & 130 Biscayne" miss).
+        # glue onto the first authority (the Brief A "100 & 130 Biscayne" miss).
         _hdr = re.sub(r"[*:]", "", stripped).strip().lower()
         _hdr = re.sub(r"\s*page\(s\)$|\s*pages?$", "", _hdr).strip()
         if _hdr in _SUBHEADERS:
@@ -1466,7 +1627,7 @@ def _strip_non_argument_sections(brief: str) -> str:
     # itself, a leader: a legal ellipsis at a sentence boundary is exactly four
     # dots ('....') and routinely starts a quote-continuation line that also
     # carries citations.  Dropping those silently deleted body citations (the
-    # Perez / In re Tex. Petroleum short-cites in Gold-Set-B [158], 2026.06.30).
+    # Perez / In re Tex. Petroleum short-cites in Brief B [158], 2026.06.30).
     # So treat a line as a leader ONLY when 4+ dots are followed by a trailing
     # page token, OR when the dot run is implausibly long (10+), which never
     # occurs in prose.
@@ -1520,6 +1681,20 @@ def build_citations(brief_text: str) -> dict:
     the two parallel pipelines had drifted (audit 3.6): the runner was still
     running enricher detection after Phase 1 moved cite_check() to eyecite.
     Returns everything the resolve/verify phases need."""
+    # --- Doubling gate (2026.07.29, Session B) -----------------------------
+    # Refuse a page-doubled brief before any processing: a duplicate text layer
+    # roughly doubles the instance count and cross-links id-chains between the
+    # two copies (Brief D diagnosis, Finding 0). Point the user at the
+    # converter, which drops the duplicate layer.
+    _dbl_frac = detect_input_doubling(brief_text)
+    if _dbl_frac > _DOUBLING_REFUSE_THRESHOLD:
+        raise DoubledInputError(
+            f"Input appears to be page-doubled: {_dbl_frac:.0%} of page blocks "
+            f"are internally near-duplicated. The source PDF almost certainly "
+            f"carries a duplicate text layer that was extracted twice, which "
+            f"corrupts citation detection. Re-convert the PDF with the "
+            f"pdf-to-cowork-txt skill (v2026.07.29 or later) -- it drops the "
+            f"duplicate layer -- then re-run the cite-check on the clean output.")
     # --- Preprocessing -----------------------------------------------------
     # (1) Strip Markdown blockquote prefixes globally.  The pdf-to-cowork-txt
     # converter wraps TOA lines in "> " blockquotes; that artifact defeats
@@ -1530,6 +1705,11 @@ def build_citations(brief_text: str) -> dict:
     # _parse_toa also returns the character span of the winning TOA block
     # so we can excise it before enrichment.
     toa_index, toa_span = _parse_toa(brief_text)
+    # Application-sentence build (2026.08.04): harvest the instant-case actor
+    # roster ONCE, from the pre-strip text (the caption lives in front matter
+    # that _strip_non_argument_sections removes) plus brief-wide defined
+    # aliases, with the TOA name-collision downweight.
+    application_roster = cc_application.harvest_roster(brief_text, toa_index)
     # (2b) Excise the TOA block from the brief before section-stripping.
     # This guarantees the TOA is gone even if _strip_non_argument_sections
     # mis-detects its boundaries.  The TOA parser already identified the
@@ -1549,7 +1729,7 @@ def build_citations(brief_text: str) -> dict:
         logging.info('cite_check: stripped %d furniture line(s)', len(_furniture))
     # (3b) Stitch wrapped lines: strip per-page furniture and rejoin citations
     # split across line/page breaks, so the enricher sees every cite contiguous.
-    # Without this, ~17 of 47 Gold-Set-A instances were dropped before detection.
+    # Without this, ~17 of 47 Brief A instances were dropped before detection.
     argument_text = _stitch_wrapped_lines(argument_text)
     # (4) Normalize the BODY only (TOA already parsed above).  Removes the
     # converter's emphasis artifacts so the enricher sees clean case names
@@ -1622,11 +1802,15 @@ def build_citations(brief_text: str) -> dict:
             cit.nested_parent_span = inst.get("parent_span_start")
         # eyecite spans are exact, so no _verify_and_correct_span re-anchoring
         # (that correction loop was root cause 3.1.1 of wrong propositions).
+        _pk: dict = {}
         cit.proposition = _refine_proposition(
             argument_text,
-            _extract_proposition(argument_text, cit.span_start, cit.span_end),
+            _extract_proposition(argument_text, cit.span_start, cit.span_end,
+                                 is_id=(inst.get("kind") == "IdCitation"),
+                                 meta=_pk),
             cit.span_start,
         )
+        cit.prop_kind = _pk.get("kind", "host")
         cit.proposition_review = not cit.proposition.strip()
         citations.append(cit)
 
@@ -1634,6 +1818,56 @@ def build_citations(brief_text: str) -> dict:
     mode, chunk_engine, chunks = "eyecite", "eyecite", [argument_text]
 
     citations = _dedupe_by_span(citations)
+
+    # Fix 9 (Finding 5): per-quote attribution. A quoted span belongs to the
+    # citation whose span immediately FOLLOWS the quote's closing mark
+    # (Bluebook placement). Any FURTHER member of that same string cite -- a
+    # cite joined to the owner by a semicolon and/or a subordinate signal
+    # ("see also", "accord", "cf.", "citing") -- is a support-only member and
+    # must never be graded FABRICATED for the owner's quote (cards 4/8: McLane,
+    # a "see also" member, was branded fabricated for Lipsky's quote). The
+    # quote and its string cite frequently sit in DIFFERENT sentences (the
+    # quote-sentence ends at the closing mark; the citation string is its own
+    # sentence), so attribution is computed globally, not per sentence.
+    _marks_all = [i for i, ch in enumerate(argument_text)
+                  if ch in ('"', "“", "”")]
+    _q_closes = [b for _a, b in zip(_marks_all[0::2], _marks_all[1::2])]
+    _starts = sorted(((c.span_start, c) for c in citations), key=lambda x: x[0])
+    _STRING_SIGNAL = re.compile(
+        r"see also|accord|\bcf\b|\bciting\b|\bsee\b|but see|but cf|"
+        r"e\.g\.|compare|contra", re.IGNORECASE)
+    for _qc in _q_closes:
+        _after = [(st, c) for st, c in _starts if st >= _qc and st - _qc <= 300]
+        if len(_after) < 2:
+            continue
+        _after.sort(key=lambda x: x[0])
+        _owner_start, _owner = _after[0]
+        _prev_end = _owner.span_end
+        for _st, _c in _after[1:]:
+            _conn = argument_text[_prev_end:_st]
+            if len(_conn) <= 160 and (";" in _conn or _STRING_SIGNAL.search(_conn)):
+                _c.quote_support_only = True
+                _prev_end = _c.span_end
+            else:
+                break
+
+    # B4 (2026.07.29): nested-parenthetical quote attribution. A quoted span
+    # inside a "(quoting X ...)" / "(citing X ...)" parenthetical belongs to
+    # the nested source X, not the citing case -- grade the instance for
+    # support only (never fabrication) for that quote.
+    for _c in citations:
+        if getattr(_c, "quote_support_only", False):
+            continue
+        _cprop = getattr(_c, "proposition", "") or ""
+        for _cq in extract_verbatim_quotes(_cprop):
+            if _quote_is_nested_attribution(_cprop, _cq):
+                _c.quote_support_only = True
+                try:
+                    _c.quote_nested_attribution = True
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+
     # Deduplicate non-case refs by name
     seen_nc = set()
     unique_nc = []
@@ -1652,6 +1886,7 @@ def build_citations(brief_text: str) -> dict:
         "mode": mode,
         "chunk_engine": chunk_engine,
         "n_chunks": len(chunks),
+        "application_roster": application_roster,
     }
 
 
@@ -1661,10 +1896,130 @@ def build_citations(brief_text: str) -> dict:
 # the one-shot cite_check() path and the checkpointed Cowork runner.  The
 # runner must never re-implement pipeline logic (audit 3.6).
 # --------------------------------------------------------------------------
+# Fix 8 (Finding 1): completeness attestation. A stored opinion copy may
+# support a CONFIRMED "quote absent" verdict (the only path to CRITICAL /
+# FABRICATED) ONLY if it plausibly runs to the END of the opinion. The old
+# gate compared len(full_text) >= len(opinion_text) -- a length comparison
+# between two copies of the SAME possibly-truncated text, which cannot detect
+# truncation. A chrome-heavy or token-capped fetch therefore produced false
+# CRITICAL fabrications (MacFarland 43/46, Pack Props 102/103, Raphael 58/59).
+# B2 (2026.07.29): DISPOSITION markers only. The old _END_OPINION_MARKERS
+# accepted a bare "/s/" signature, "chief justice", "circuit judge",
+# "opinion by", so a certificate-of-service signature block in a 3.9k RECAP
+# filing (Gensetix [19/20]) false-attested COMPLETE and let a fabrication
+# render CRITICAL against the wrong, short document. Completeness now requires
+# a genuine disposition / opinion-delivered marker near the tail; a lone
+# signature no longer suffices.
+_END_OPINION_MARKERS = re.compile(
+    r"(?:it is (?:hereby |therefore |so )*ordered"
+    r"|so ordered"
+    r"|we (?:therefore |accordingly |thus )?"
+    r"(?:affirm|reverse|remand|vacate|dismiss|deny|grant|render|modify|"
+    r"conclude|hold)\b"
+    r"|(?:judgment|order|petition|motion|conviction|appeal) (?:is |are )?"
+    r"(?:affirmed|reversed|vacated|remanded|dismissed|denied|granted|"
+    r"modified|rendered)"
+    r"|affirmed in part"
+    r"|reversed and remanded"
+    r"|delivered the opinion of the court"
+    r"|per curiam)",
+    re.IGNORECASE,
+)
+
+# A tail dominated by a certificate of service / e-file receipt is a FILING,
+# not an opinion ending -- exclude it (B2).
+_CERT_OF_SERVICE_RE = re.compile(
+    r"certificate of service"
+    r"|i (?:hereby )?certify that"
+    r"|true and correct copy"
+    r"|was (?:served|e-?served|filed and served) (?:on|upon|via|by)"
+    r"|electronically (?:filed|served) (?:with|via|through)",
+    re.IGNORECASE,
+)
+
+# B3 (2026.07.29): a body far larger than any single appellate opinion is
+# almost certainly a consolidated record or the wrong document (Berry [72]
+# resolved to a 176,808-char doc, and the discovery-rule quote that should
+# verify was absent -> false fabrication). Above this bound, completeness is
+# NOT attested, so an absent quote degrades to review rather than CRITICAL.
+_MAX_SINGLE_OPINION_CHARS = 150_000
+
+
+def _opinion_is_complete(text):
+    """Attest that a stored opinion copy plausibly runs to the END of a single
+    opinion. Requires (a) a plausible body length, (b) a genuine disposition /
+    opinion-delivered marker near the tail (NOT a bare signature -- B2), (c) a
+    tail that is not a certificate-of-service / e-file receipt (B2), and (d) a
+    body not wildly oversized for a single appellate opinion (B3). A trimmed
+    pincite window, a truncated/chrome-heavy fetch, a docket filing, or a
+    consolidated record fails this, so a "quote absent" result on such a copy
+    degrades to "review" rather than a CRITICAL fabrication (Finding 1)."""
+    if not text:
+        return False
+    if len(text) < 1200:
+        return False
+    if len(text) > _MAX_SINGLE_OPINION_CHARS:
+        return False
+    tail = text[-6000:]
+    if not _END_OPINION_MARKERS.search(tail):
+        return False
+    if _CERT_OF_SERVICE_RE.search(tail) and not re.search(
+            r"(?:affirm|revers|remand|render|vacate|per curiam"
+            r"|delivered the opinion)", tail, re.IGNORECASE):
+        return False
+    return True
+
+
+def _has_opinion_disposition(text):
+    """B1 helper (2026.07.29): True if `text` reads like a court opinion that
+    reached a disposition -- a genuine disposition / opinion-delivered marker
+    appears and the body is opinion-length. Used by the resolver's RECAP
+    acceptance guard to reject docket filings that are not the cited opinion."""
+    if not text or len(text) < 1200:
+        return False
+    return bool(_END_OPINION_MARKERS.search(text))
+
+
+_NESTED_QUOTING_SIGNAL = re.compile(r"\b(?:quoting|citing)\b", re.IGNORECASE)
+
+
+def _quote_is_nested_attribution(prop, quote):
+    """B4 (2026.07.29): True when `quote` occurs inside a parenthetical that
+    opens with a 'quoting'/'citing' signal, so the quoted words belong to the
+    nested source, not the citing case (M&M [88]: a nested (quoting Riverside)
+    quote was branded fabricated against Marcus & Millichap)."""
+    if not prop or not quote:
+        return False
+    key = quote.strip()[:40]
+    idx = prop.find(key)
+    if idx < 0:
+        prop = re.sub(r"\s+", " ", prop)
+        idx = prop.find(re.sub(r"\s+", " ", quote.strip())[:40])
+        if idx < 0:
+            return False
+    # Scan each "(quoting ...)" / "(citing ...)" parenthetical; the quote is
+    # nested-attributed if it falls within one such paren's span (the quote may
+    # sit in a further-nested paren, so we test the outer paren's full extent).
+    for m in re.finditer(r"\((?:[^()]*?\b(?:quoting|citing)\b)", prop, re.IGNORECASE):
+        open_pos = m.start()
+        depth, close_pos = 0, len(prop)
+        for j in range(open_pos, len(prop)):
+            if prop[j] == "(":
+                depth += 1
+            elif prop[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    close_pos = j
+                    break
+        if open_pos < idx < close_pos:
+            return True
+    return False
+
+
 def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
                     opinion_source="", nc_ok=None, search_url="",
                     search_detail="", lookup_status=None, lookup_note=None,
-                    full_text=None):
+                    full_text=None, full_text_complete=None):
     """Verify ONE citation against its resolved opinion text.
 
     Encapsulates the post-resolution pipeline: the no-text and
@@ -1729,6 +2084,15 @@ def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
     q_matched, quote_note = False, ""
     quote_results, any_fab = [], False
     _lic = bool(getattr(cit, "quote_license", "") or "")
+    _support_only = bool(getattr(cit, "quote_support_only", False))
+    # Fix 8: completeness attestation for the copy behind any CONFIRMED
+    # (CRITICAL) fabrication. Prefer an attestation recorded at patch time;
+    # otherwise attest from the best available copy's own end-of-opinion
+    # markers -- never from a length comparison.
+    if full_text_complete is not None:
+        _complete = bool(full_text_complete)
+    else:
+        _complete = _opinion_is_complete(full_text or opinion_text)
     vqs = extract_verbatim_quotes(cit.proposition or "")
     # Phase 6 (B1 Cits 2 & 5): when NO >=25-char quoted span survived
     # extraction, try to recover a whole-sentence quotation whose opening mark
@@ -1755,16 +2119,17 @@ def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
             # against the FULL opinion text before it stands. The pincite
             # trim can exclude a block quote's tail or a quote at another
             # page; FABRICATED may stand only after the full-text recheck.
-            if _qv.result.value != "VERBATIM" and full_text:
-                if len(full_text) > len(opinion_text or ""):
+            if _qv.result.value != "VERBATIM":
+                if full_text and len(full_text) > len(opinion_text or ""):
                     _qv2 = cc_quote_matcher.verify_quote(_q, full_text,
                                                          license_signal=_lic)
                     if (_rank[_qv2.result.value], _qv2.similarity) > \
                             (_rank[_qv.result.value], _qv.similarity):
                         _qv = _qv2
-                # Phase 7: when full_text == the window, the window IS the
-                # complete opinion -- the check already ran against it.
-                _full_checked = len(full_text) >= len(opinion_text or "")
+                # Fix 8: a FABRICATED may be CONFIRMED (-> CRITICAL) only when
+                # the copy checked is attested COMPLETE, not merely as long as
+                # the pincite window.
+                _full_checked = _complete
             _long_results.append({
                 "quote": _q,
                 "result": _qv.result.value,
@@ -1802,15 +2167,16 @@ def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
             # Phase 7 confirmation gate: a short quote is re-checked
             # against the COMPLETE opinion before any adverse result may
             # stand -- the pincite window can exclude the very page the
-            # phrase sits on (QA-Brief cit 8, "innocent stakeholder").
-            if _sv.result.value != "VERBATIM" and full_text:
-                if len(full_text) > len(opinion_text or ""):
+            # phrase sits on (Brief C cit 8, "innocent stakeholder").
+            if _sv.result.value != "VERBATIM":
+                if full_text and len(full_text) > len(opinion_text or ""):
                     _sv2 = cc_quote_matcher.verify_quote(
                         _sq, full_text, license_signal=_lic, strict=True)
                     if (_srank[_sv2.result.value], _sv2.similarity) > \
                             (_srank[_sv.result.value], _sv.similarity):
                         _sv = _sv2
-                _s_checked = len(full_text) >= len(opinion_text or "")
+                # Fix 8: confirm only against an attested-complete copy.
+                _s_checked = _complete
             _short_results.append({
                 "quote": _sq,
                 "result": _sv.result.value,
@@ -1826,7 +2192,7 @@ def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
                 "short": True,
             })
     quote_results = _long_results + _short_results
-    # Phase 7 confirmation gate (author 2026.07.15). The CRITICAL signal
+    # Phase 7 confirmation gate (the attorney 2026.07.15). The CRITICAL signal
     # (quote_fabricated) fires only on a CONFIRMED absence -- checked
     # against the complete opinion -- and covers EVERY quoted span, long
     # or short (a fabricated two-word quote is still a fabrication). An
@@ -1837,7 +2203,24 @@ def verify_citation(cit, opinion_text, *, client=None, opinion_url="",
     _fabs_u = [qr for qr in quote_results
                if qr["result"] == "FABRICATED" and not qr.get("confirmed")]
     any_fab = bool(_fabs_c)
-    if any_fab:
+    if _support_only:
+        # Fix 9 (Finding 5): a string-cite member never carries another
+        # authority's quotation. Suppress fabrication; grade support only.
+        any_fab = False
+        q_matched = False
+        for qr in quote_results:
+            if qr.get("result") == "FABRICATED":
+                qr["support_only"] = True
+        if getattr(cit, "quote_nested_attribution", False):
+            quote_note = ("Quoted language is nested inside a "
+                          "\u201c(quoting/citing \u2026)\u201d parenthetical "
+                          "and belongs to the cited source, not this case; "
+                          "graded for support only, not quote fidelity.")
+        else:
+            quote_note = ("Quoted language in this sentence is placed with another "
+                      "citation in the string cite; this instance is graded for "
+                      "support only, not quote fidelity.")
+    elif any_fab:
         _fq = _fabs_c[0]
         if _fq.get("short"):
             quote_note = (
@@ -1946,6 +2329,10 @@ def finalize_results(built, results):
     toa_only:  listed in the TOA, never cited in the body.
     """
     toa_index = built["toa_index"]
+    # Application-sentence build (2026.08.04): detector + verified-sibling
+    # cross-check over the FINAL propositions (agent-supplied ones included).
+    # Idempotent; re-run at render so Step 6.6 overrides update siblings.
+    cc_application.attach(results, built.get("application_roster"))
     body_only_cases, toa_only_cases = [], []
     if toa_index:
         matched_keys = set()
@@ -1971,6 +2358,7 @@ def finalize_results(built, results):
         "toa_index": toa_index,
         "toa_only_cases": toa_only_cases,
         "body_only_cases": body_only_cases,
+        "application_roster": built.get("application_roster"),
     }
 
 
@@ -2107,6 +2495,7 @@ def cite_check(
         "toa_index": toa_index,
         "toa_only_cases": toa_only_cases,
         "body_only_cases": body_only_cases,
+        "application_roster": built.get("application_roster"),
     }
 
 
@@ -2420,3 +2809,147 @@ def _find_body_marker(brief: str, fn_num: int, ceiling: int) -> Optional[int]:
     idx = body.rfind(bracketed)
     if idx >= 0:
         return idx + 1  # skip the bracket, point at the digit
+
+
+# ---------------------------------------------------------------------------
+# I3 (2026.07.29, Session E): statute-quote verification (Texas)
+#
+# A case card whose proposition BOTH quotes text AND cites a Texas code
+# section gets a STATUTE CHECK note: the quoted passage is compared against
+# the CURRENT statute text (statutes.capitol.texas.gov, Justia code mirror as
+# fallback), and when the statute was amended AFTER the cited case's decision
+# year the note flags that the case may quote the pre-amendment text (Lipsky
+# 2015 quotes pre-2019 TCPA SS 27.003).  Notes only -- verdicts never change.
+# The fetch is agent-driven (runner verbs `statutes` / `statute_check`), same
+# contract as the gap loop.
+# ---------------------------------------------------------------------------
+_TX_STATUTE_REF_RE = re.compile(
+    r"Tex(?:as|\.)?\s+"
+    r"(Civ\.?\s*Prac\.?\s*&\s*Rem\.?|Bus\.?\s*&\s*Com(?:m)?\.?|"
+    r"Gov(?:'t|t)?\.?|Prop\.?|Fam\.?|Lab\.?|Occ\.?|Penal|Tax|Ins\.?|"
+    r"Elec\.?|Est(?:ates)?\.?|Health\s*&\s*Safety|Loc\.?\s*Gov(?:'t|t)?\.?)"
+    r"\s*Code(?:\s*Ann\.?)?\s*(?:\u00a7{1,2}|Sec(?:tion|s)?\.?)\s*"
+    r"(\d+[A-Za-z]?\.\d+)",
+    re.IGNORECASE)
+
+_TX_CODE_LETTERS = {
+    "civ": "CP", "bus": "BC", "gov": "GV", "prop": "PR", "fam": "FA",
+    "lab": "LA", "occ": "OC", "pen": "PE", "tax": "TX", "ins": "IN",
+    "ele": "EL", "est": "ES", "hea": "HS", "loc": "LG",
+}
+
+
+def _tx_code_letters(code_txt):
+    """statutes.capitol.texas.gov code letters from a cited code name."""
+    key = re.sub(r"[^a-z]", "", (code_txt or "").lower())[:3]
+    return _TX_CODE_LETTERS.get(key, "")
+
+
+def statute_url_candidates(code_letters, section):
+    """Candidate URLs for the CURRENT text of a Texas code section.  The
+    capitol chapter page is authoritative but currently renders as a site
+    shell via web_fetch (checked 2026.07.29) -- the Justia Texas-codes mirror
+    is the working fallback; both are listed for the agent."""
+    if not code_letters or "." not in (section or ""):
+        return []
+    chapter = section.split(".")[0]
+    return [
+        ("statutes.capitol",
+         "https://statutes.capitol.texas.gov/Docs/%s/htm/%s.%s.htm"
+         % (code_letters, code_letters, chapter)),
+        ("justia_codes",
+         "https://law.justia.com/codes/texas/"),
+    ]
+
+
+def statute_quote_targets(cits, context_text=None, window=600):
+    """I3 targets: [{index, name, refs: [{code, section, candidates}],
+    quotes}] for every citation whose proposition both quotes text and cites
+    a Texas code section.  Proposition glue often drops the section number
+    (the Brief D Lipsky instances render as a bare "TEX. CIV. PRAC. & REM.
+    CODE" heading), so when `context_text` (the brief's argument text) is
+    supplied, the +/-`window`-char span around the citation is scanned for
+    the full code-plus-section reference as well."""
+    out = []
+    for i, c in enumerate(cits):
+        prop = getattr(c, "proposition", "") or ""
+        ctx = " ".join(filter(None, [
+            prop, getattr(c, "cite_text", "") or ""]))
+        s = getattr(c, "span_start", None)
+        if context_text and s is not None:
+            ctx += " " + context_text[max(0, s - window):s + window]
+        refs = _TX_STATUTE_REF_RE.findall(ctx)
+        if not refs:
+            continue
+        quotes = _VERBATIM_QUOTE_RE.findall(prop)
+        if not quotes:
+            continue
+        seen, entries = set(), []
+        for code_txt, section in refs:
+            letters = _tx_code_letters(code_txt)
+            key = (letters, section)
+            if not letters or key in seen:
+                continue
+            seen.add(key)
+            entries.append({
+                "code": letters, "section": section,
+                "candidates": [{"source": s, "url": u}
+                               for s, u in statute_url_candidates(letters, section)]})
+        if entries:
+            out.append({"index": i, "name": getattr(c, "name", ""),
+                        "refs": entries, "quotes": quotes})
+    return out
+
+
+def _statute_norm(t):
+    """Normalize for statute-quote containment: unify quote marks, unwrap
+    bracket edits ([h]ad -> had), drop ellipses, collapse whitespace."""
+    t = (t or "").replace("\u201c", '"').replace("\u201d", '"')
+    t = re.sub(r"\[(\w+)\]", r"\1", t)
+    t = re.sub(r"\.\s?\.\s?\.|\u2026", " ", t)
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def statute_check_note(citation, statute_text, url=""):
+    """The STATUTE CHECK note for a citation given fetched statute text, or
+    '' when the proposition has no quoted text.  Reports how many quoted
+    passages appear in the CURRENT statute text and, when the section was
+    amended after the cited case's decision year, flags the possible
+    pre-amendment quotation.  Never changes a verdict."""
+    quotes = _VERBATIM_QUOTE_RE.findall(getattr(citation, "proposition", "") or "")
+    if not quotes:
+        return ""
+    body = _statute_norm(statute_text)
+    checked = []
+    for q in quotes:
+        qn = _statute_norm(q)
+        frags = [f.strip() for f in re.split(r"\.\s?\.\s?\.|\u2026", q)
+                 if len(_statute_norm(f)) >= 15]
+        if frags:
+            ok = all(_statute_norm(f) in body for f in frags)
+        else:
+            ok = qn in body
+        checked.append(ok)
+    matched, total = sum(checked), len(checked)
+    src = url or "statutes.capitol.texas.gov"
+    if matched == total:
+        note = ("STATUTE CHECK: the quoted passage(s) on this card track the "
+                "CURRENT statute text (%s)." % src)
+    else:
+        note = ("STATUTE CHECK: %d of %d quoted passage(s) on this card do "
+                "not appear in the CURRENT statute text (%s) -- expected when "
+                "the quote is the cited case's own language rather than "
+                "statutory text." % (total - matched, total, src))
+    years = sorted({int(y) for y in re.findall(
+        r"Acts\s+((?:19|20)\d{2})", statute_text or "")})
+    cy = None
+    yrs = re.findall(r"\b((?:19|20)\d{2})\b",
+                     getattr(citation, "cite_text", "") or "")
+    if yrs:
+        cy = int(yrs[-1])
+    later = [y for y in years if cy and y > cy]
+    if later:
+        note += (" Section amended by Acts %s AFTER the cited case (%d) -- if "
+                 "the quote is offered as statutory text, verify it against "
+                 "the historical version." % (", ".join(str(y) for y in later), cy))
+    return note
