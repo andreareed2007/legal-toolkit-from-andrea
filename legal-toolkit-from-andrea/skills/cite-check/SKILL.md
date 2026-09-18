@@ -7,7 +7,7 @@ description: "Cite-check a brief or motion using the eyecite + CourtListener + I
 
 ## HARD RULE: Never Read PDFs Directly in Cowork
 
-**NEVER use the Read tool on a .pdf file. NEVER use bash/pdfplumber/pdftotext to extract PDF text inline.** Always look for a pre-converted `_COWORK.md` file in the matter's `_cowork_txt/` subfolder first. If no converted version exists, invoke the `pdf-to-cowork` skill to create one before proceeding. This rule has no exceptions.
+**NEVER use the Read tool on a .pdf file. NEVER use bash/pdfplumber/pdftotext to extract PDF text inline.** Always look for a pre-converted `_COWORK.md` file in the matter's `_cowork_txt/` subfolder first. If no converted version exists, invoke the `pdf-to-cowork-txt` skill to create one before proceeding. This rule has no exceptions.
 
 ---
 
