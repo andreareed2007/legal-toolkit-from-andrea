@@ -21,10 +21,11 @@ modify, and redistribute. No warranty. Attribution appreciated but not required.
   build → patch → validate pipeline. Supports Texas state, New York Supreme
   Court, federal, Texas Business Court, and AAA arbitration out of the box, plus
   a **California** scaffold you populate from your own sample pleadings.
-- **pdf-to-cowork** — Converts large PDFs (transcripts, briefs, exhibit binders)
-  into Markdown/plain text the assistant can read and search natively, with a
-  content-gap report. Runs entirely in the shell sandbox — no host-OS
-  dependency.
+- **pdf-to-cowork-txt** — Converts large PDFs (transcripts, briefs, exhibit
+  binders, scanned productions) into Markdown/plain text the assistant can read
+  and search natively, with automatic OCR fallback, Bates/confidentiality-stamp
+  capture, and a content-gap report. Runs entirely in the shell sandbox — no
+  host-OS dependency, no admin rights required.
 - **court-filing-normalizer** — batch-renames court filing PDFs (NYSCEF,
   ECF/PACER, eFileTexas) to a consistent `YYYY.MM.DD [docket #] Title.pdf`
   convention, extracting date, docket number, and title from PDF content, with a

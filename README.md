@@ -20,8 +20,9 @@ eleven skills:
 - **court-filing** — builds and validates filing-ready Word documents with proper
   captions, numbering, and signature blocks. Supports Texas state, New York
   Supreme Court, federal, Texas Business Court, and AAA arbitration.
-- **pdf-to-cowork** — converts PDFs into clean Markdown or plain text that Claude
-  can fully read and search.
+- **pdf-to-cowork-txt** — converts PDFs into clean Markdown or plain text that
+  Claude can fully read and search, with automatic OCR fallback and Bates/
+  confidentiality-stamp capture.
 - **court-filing-normalizer** — batch-renames court filing PDFs (NYSCEF,
   ECF/PACER, eFileTexas) to a consistent dated, docketed naming convention.
 - **date-checker** — verifies every date in a draft against the real calendar

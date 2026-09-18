@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-pdf_to_cowork_md.py — Cowork Edition (v2)
-------------------------------------------
+pdf_to_cowork_md.py — Cowork Edition (v3, opendataloader-pdf engine)
+--------------------------------------------------------------------
 Converts PDF(s) to Markdown (.md) or plain-text (.txt) files that Cowork
 can read completely and search.
 
-HYBRID ARCHITECTURE:
-  - pdftotext -layout  → raw text extraction (gold standard for text quality)
-  - pymupdf (PyMuPDF)  → font metadata overlay (headings, bold, italic detection)
-  - pdfplumber / pypdf  → fallback text extraction if pdftotext unavailable
+ENGINE CHAIN (every tier quality-gated against the pdftotext reference):
+  - opendataloader-pdf → first tier for .md AND .txt: XY-Cut++ reading order,
+    headings, lists, real Markdown tables, ~~strikethrough~~, header/footer
+    and hidden/off-page text filtering. Local Java mode ONLY — the hybrid/AI
+    (OCR) backend is never enabled.
+  - pymupdf4llm        → second-tier .md engine (font-hierarchy headings, tables)
+  - pymupdf (PyMuPDF)  → legacy font-metadata renderer (headings, bold, italic)
+  - pdftotext -layout  → reference text extraction + .txt fallback
+  - pdfplumber / pypdf → fallback text extraction if pdftotext unavailable
 
 DOCUMENT-TYPE ROUTING:
-  - Depositions (monospaced, line numbers, Q/A markers) → .txt (pdftotext -layout)
-  - Two-column detected → .txt (pdftotext -layout)
-  - Everything else (briefs, motions, orders, contracts) → .md (Markdown with
-    structural headings, inline emphasis, caption blockquotes)
+  - Depositions (monospaced, line numbers, Q/A markers) → .txt
+  - Two-column detected → .txt
+  - Everything else (briefs, motions, orders, contracts) → .md
+
+WORKING COPY:
+  - --password decrypts once into a temp copy; --pages subsets the PDF and
+    the output keeps ORIGINAL page numbers.
 
 Validation:
   - Page count match (extracted vs. PDF total)
@@ -46,7 +54,7 @@ from pathlib import Path
 
 
 def _win_path(p: Path) -> Path:
-    """Return a Path prefixed with \\?\ on Windows to bypass the 260-char MAX_PATH limit."""
+    r"""Return a Path prefixed with \\?\ on Windows to bypass the 260-char MAX_PATH limit."""
     if sys.platform != "win32":
         return p
     s = str(p.resolve())
@@ -304,8 +312,24 @@ def find_native_txt_sidecar(pdf_path: Path):
     if os.environ.get("COWORK_IGNORE_SIDECAR"):
         return None, None
     stem = pdf_path.stem
-    for cand in (pdf_path.parent / "Text" / f"{stem}.txt",
-                 pdf_path.parent / f"{stem}.txt"):
+    parent = pdf_path.parent
+    cands = [parent / "Text" / f"{stem}.txt", parent / f"{stem}.txt"]
+    # Relativity / Concordance load-file layout: the PDF sits in
+    # VOL001/IMAGES/IMG001/ and its extracted text in VOL001/TEXT/TEXT001/.
+    # Walk up to the volume folder (2 levels) and look under any TEXT* dir.
+    for up in (parent.parent, parent.parent.parent):
+        try:
+            if not _win_path(up).is_dir():
+                continue
+            for d in _win_path(up).iterdir():
+                if d.is_dir() and d.name.upper().startswith("TEXT"):
+                    cands.append(d / f"{stem}.txt")
+                    for sub in d.iterdir():
+                        if sub.is_dir():
+                            cands.append(sub / f"{stem}.txt")
+        except Exception:
+            pass
+    for cand in cands:
         try:
             if _win_path(cand).exists():
                 txt = _win_path(cand).read_text(encoding="utf-8", errors="replace")
@@ -769,14 +793,16 @@ def detect_headers_footers(meta: dict) -> dict:
 def _clean_page_numbers(text: str) -> str:
     """Strip page-number patterns from text for fuzzy comparison."""
     cleaned = text
+    # "Page 3 of 66", "- Page 3 of 66", "Page 3 / 66" — must run BEFORE the
+    # trailing-number strip below, which would otherwise eat the "66" and
+    # leave "Page 3 of" varying per page (so the footer never repeats).
+    cleaned = re.sub(r'\s*[–—-]?\s*[Pp]age\s+\d+\s*(of|/)\s*\d+\s*', ' ', cleaned)
     # "– Page 3", "- Page 3", "— Page 42"
     cleaned = re.sub(r'\s*[–—-]\s*[Pp]age\s+\d+\s*$', '', cleaned)
     # Trailing bare numbers (common page markers)
     cleaned = re.sub(r'\s+\d+\s*$', '', cleaned)
     # Leading bare numbers
     cleaned = re.sub(r'^\s*\d+\s+', '', cleaned)
-    # "Page 3 of 66"
-    cleaned = re.sub(r'\s*[Pp]age\s+\d+\s+(of|/)\s+\d+\s*', '', cleaned)
     return cleaned.strip()
 
 
@@ -1131,6 +1157,970 @@ def _render_inline_emphasis(spans: list, body_font: str, body_size: float,
 
 # ── Text Extraction Methods ──────────────────────────────────────────────────
 
+
+# ── pymupdf4llm Markdown Engine (v2026.08.27-1) ──────────────────────────────
+# Default engine for .md output. Produces GitHub-flavored Markdown per page:
+# heading levels from document font hierarchy, real Markdown tables, bold /
+# italic, lists. Text-layer only — never OCRs. Quality-gated: if output loses
+# content vs the reference extraction, or shows dual-layer doubling, the
+# legacy font-metadata renderer is used instead.
+
+def _alnum_len(s: str) -> int:
+    return sum(1 for c in s if c.isalnum())
+
+
+def extract_md_pages_pymupdf4llm(pdf_path: Path, true_page_count: int):
+    """
+    Per-page Markdown via pymupdf4llm. Returns list of page markdown strings
+    (index 0 = page 1) or None if pymupdf4llm is unavailable or errors.
+    """
+    try:
+        import pymupdf4llm
+    except ImportError:
+        return None
+    try:
+        try:
+            # HARD RULE: use_ocr=False / force_ocr=False — pymupdf4llm >= 1.28
+            # ships an integrated OCR path (Tesseract/RapidOCR) that is ON by
+            # default. This skill NEVER OCRs without going through its own
+            # controlled Tesseract pass, so it is disabled unconditionally here.
+            chunks = pymupdf4llm.to_markdown(
+                str(_win_path(pdf_path)), page_chunks=True, show_progress=False,
+                use_ocr=False, force_ocr=False,
+            )
+        except TypeError:
+            # Older pymupdf4llm without the layout/OCR engine: the rag path
+            # has no OCR capability at all, so plain call is safe.
+            chunks = pymupdf4llm.to_markdown(str(_win_path(pdf_path)), page_chunks=True)
+    except Exception as e:
+        print(f"[pymupdf4llm failed: {e}]", end=" ", flush=True)
+        return None
+    md_pages = [""] * true_page_count
+    for i, ch in enumerate(chunks):
+        if i >= true_page_count:
+            break
+        md_pages[i] = (ch.get("text") or "").strip()
+    return md_pages
+
+
+def md_engine_quality_ok(md_pages, raw_pages, engine: str = "pymupdf4llm", skip_pages=None) -> bool:
+    """
+    Doc-level acceptance gate for a structured engine's output (opendataloader-pdf
+    or pymupdf4llm). Reject (-> next engine in the chain) when content is lost
+    vs the reference pdftotext extraction or when the output shows
+    duplicate-text-layer doubling.
+    """
+    if md_pages is None:
+        return False
+    skip = set(skip_pages or ())   # 1-based pages whose reference text came from OCR
+    md_chars = sum(_alnum_len(p) for i, p in enumerate(md_pages, 1) if i not in skip)
+    raw_chars = sum(_alnum_len(p) for i, p in enumerate(raw_pages, 1) if i not in skip)
+    if raw_chars >= 200 and md_chars < 0.70 * raw_chars:
+        print(f"[{engine} content check failed: {md_chars} vs {raw_chars} alnum chars]",
+              end=" ", flush=True)
+        return False
+    if page_doubling_fraction(md_pages) >= 0.30:
+        print(f"[{engine} doubling check failed]", end=" ", flush=True)
+        return False
+    return True
+
+
+# ── opendataloader-pdf Engine ────────────────────────────────────────────────
+#
+# opendataloader-pdf (Apache 2.0, https://github.com/opendataloader-project/
+# opendataloader-pdf) is a deterministic Java PDF-structure extractor with
+# XY-Cut++ reading order, heading/list/table detection, strikethrough
+# detection, header/footer filtering and hidden/off-page text filtering.
+# It is the FIRST-TIER engine for both .md and .txt output. Only its free,
+# local Java mode is ever used here. The hybrid/AI backend (docling-fast,
+# hancom-ai) performs OCR and is NEVER enabled — see the No-OCR rule.
+# Requires: pip install opendataloader-pdf, plus a Java 11+ runtime on PATH.
+# If either is missing the chain falls through to pymupdf4llm / pdftotext.
+
+ODL_PAGE_SEP = "\n@@COWORK-ODL-PAGE %page-number%@@\n"
+_ODL_PAGE_RE = re.compile(r"^@@COWORK-ODL-PAGE (\d+)@@[ \t]*$", re.M)
+_ODL_ORDINAL_BULLET_RE = re.compile(
+    r"^(\s*)- (?=(?:\d{1,4}[.)]|\(\w{1,4}\)|[A-Za-z][.)]|[ivxlcIVXLC]{1,6}[.)])\s)"
+)
+
+
+def odl_version():
+    try:
+        from importlib.metadata import version
+        return version("opendataloader-pdf")
+    except Exception:
+        return None
+
+
+def odl_available():
+    """Returns (ok, reason). Never installs anything."""
+    try:
+        import opendataloader_pdf  # noqa: F401
+    except ImportError:
+        return False, "opendataloader-pdf not installed (pip install opendataloader-pdf)"
+    if not shutil.which("java"):
+        return False, "java runtime not in PATH (opendataloader-pdf needs Java 11+)"
+    return True, ""
+
+
+def _normalize_odl_md(page: str) -> str:
+    """
+    Post-process one page of opendataloader-pdf Markdown for verbatim fidelity:
+      - '- 1. text' / '- (a) text' list items: the document's own ordinal is
+        the marker, so drop the synthetic '- ' bullet (keeps numbered
+        paragraphs verbatim; '1. text' is still a valid Markdown list).
+      - Drop empty tables (rectangles on signature pages become '| |').
+      - Collapse 3+ blank lines to 2.
+    """
+    if not page:
+        return page
+    out = []
+    table_buf = []
+
+    def flush_table():
+        if table_buf:
+            if any(_alnum_len(l) for l in table_buf):
+                out.extend(table_buf)
+            table_buf.clear()
+
+    for line in page.splitlines():
+        if line.lstrip().startswith("|"):
+            table_buf.append(line)
+            continue
+        flush_table()
+        out.append(_ODL_ORDINAL_BULLET_RE.sub(r"\1", line))
+    flush_table()
+    text = "\n".join(out)
+    # '~~This~~ ~~clause~~ ~~was~~' (per-word strikethrough) -> '~~This clause was~~'
+    text = re.sub(r"~~([ \t]+)~~(?=\S)", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def run_odl(pdf_path: Path, fmt: str, odl_opts: dict):
+    """
+    Run opendataloader-pdf ONCE (local Java mode only) and return
+    {"md": <markdown text or None>, "json": <parsed JSON tree or None>}.
+    Markdown is requested for fmt='md'; JSON is always requested — it is the
+    source for .txt output (see _odl_json_pages) and for Bates/confidentiality
+    stamp detection (see detect_stamps_from_odl). Returns None if the engine
+    is unavailable or fails.
+    """
+    ok, reason = odl_available()
+    if not ok:
+        print(f"[skip: {reason}]", end=" ", flush=True)
+        return None
+    import contextlib
+    import io
+    import tempfile
+    import opendataloader_pdf
+
+    odl_opts = odl_opts or {}
+    result = {"md": None, "json": None}
+    with tempfile.TemporaryDirectory(prefix="cowork_odl_") as td:
+        kwargs = dict(
+            input_path=str(pdf_path.resolve()),
+            output_dir=td,
+            format="markdown,json" if fmt == "md" else "json",
+            quiet=True,
+            image_output="off",
+        )
+        # Verbatim first: ODL's own header/footer/watermark filter is
+        # position-based over the WHOLE page and drops anything that repeats
+        # at the same spot on most pages — running headers, but also Bates
+        # stamps, CONFIDENTIAL legends, exhibit labels and (on form-like
+        # documents) real body text. So it is kept OFF here; the .md path
+        # strips only zone-limited repeating headers/footers via the skill's
+        # own detector (_strip_hf_from_md), and .txt keeps everything.
+        kwargs["include_header_footer"] = True
+        if fmt == "md":
+            kwargs["markdown_page_separator"] = ODL_PAGE_SEP
+            kwargs["detect_strikethrough"] = True
+        else:
+            # .txt is the verbatim path: keep the PDF's own line breaks
+            # (applies to the JSON 'content' fields too).
+            kwargs["keep_line_breaks"] = True
+        if odl_opts.get("use_struct_tree"):
+            kwargs["use_struct_tree"] = True
+        if odl_opts.get("sanitize"):
+            kwargs["sanitize"] = True
+        if odl_opts.get("content_safety_off"):
+            kwargs["content_safety_off"] = odl_opts["content_safety_off"]
+        if odl_opts.get("table_method"):
+            kwargs["table_method"] = odl_opts["table_method"]
+        if odl_opts.get("threads") and int(odl_opts["threads"]) > 1:
+            kwargs["threads"] = str(odl_opts["threads"])
+        # NOTE: no 'hybrid' / 'hybrid_mode' / 'hybrid_url' keys are ever set.
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                opendataloader_pdf.convert(**kwargs)
+        except Exception as e:
+            msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
+            print(f"[opendataloader-pdf failed: {msg}]", end=" ", flush=True)
+            return None
+
+        def _find(ext):
+            cand = Path(td) / f"{pdf_path.stem}.{ext}"
+            if cand.exists():
+                return cand
+            hits = list(Path(td).glob(f"*.{ext}"))
+            return hits[0] if hits else None
+
+        jf = _find("json")
+        if jf is not None:
+            try:
+                result["json"] = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+            except Exception as e:
+                print(f"[opendataloader-pdf json unreadable: {e}]", end=" ", flush=True)
+        if fmt == "md":
+            mf = _find("md")
+            if mf is not None:
+                result["md"] = mf.read_text(encoding="utf-8", errors="replace")
+    if result["md"] is None and result["json"] is None:
+        print("[opendataloader-pdf produced no output]", end=" ", flush=True)
+        return None
+    return result
+
+
+def _odl_md_pages(md_text: str, true_page_count: int):
+    """Split ODL Markdown on the page separator into a per-page list."""
+    pages = [""] * true_page_count
+    if not md_text:
+        return None
+    parts = _ODL_PAGE_RE.split(md_text)
+    if len(parts) < 3:
+        if true_page_count == 1:
+            pages[0] = md_text.strip()
+    else:
+        for i in range(1, len(parts) - 1, 2):
+            try:
+                n = int(parts[i])
+            except ValueError:
+                continue
+            if 1 <= n <= true_page_count:
+                pages[n - 1] = parts[i + 1].strip()
+    return [_normalize_odl_md(p) for p in pages]
+
+
+_ODL_CHILD_KEYS = ("kids", "list items", "rows", "cells")
+
+
+def _odl_walk(node, page, out):
+    """Depth-first walk of the ODL JSON tree in reading order.
+    Appends (page, type, content, bbox) for every node with text content;
+    children inherit the page of their nearest ancestor when their own is null."""
+    if isinstance(node, list):
+        for k in node:
+            _odl_walk(k, page, out)
+        return
+    if not isinstance(node, dict):
+        return
+    pg = node.get("page number")
+    if not isinstance(pg, int):
+        pg = page
+    content = node.get("content")
+    if isinstance(content, str) and content.strip():
+        out.append((pg, node.get("type", ""), content, node.get("bounding box")))
+    if node.get("type") == "table":
+        cells = _transcript_cells_in_order(node)
+        if cells is not None:
+            for c in cells:
+                _odl_walk(c, pg, out)
+            return
+    # Child containers are keyed by element type: generic 'kids', list
+    # 'list items', table 'rows', table row 'cells' (ODL 2.5.x JSON).
+    for key in _ODL_CHILD_KEYS:
+        kids = node.get(key)
+        if kids:
+            _odl_walk(kids, pg, out)
+
+
+_TRANSCRIPT_PAGE_LABEL_RE = re.compile(r"^\s*Page\s+(\d{1,5})\s*$", re.I)
+
+
+def _first_text(node):
+    """First non-empty text content in a subtree (depth-first)."""
+    if isinstance(node, list):
+        for k in node:
+            t = _first_text(k)
+            if t:
+                return t
+        return None
+    if not isinstance(node, dict):
+        return None
+    c = node.get("content")
+    if isinstance(c, str) and c.strip():
+        return c.strip().splitlines()[0]
+    for key in _ODL_CHILD_KEYS:
+        if node.get(key):
+            t = _first_text(node[key])
+            if t:
+                return t
+    return None
+
+
+def _transcript_cells_in_order(table: dict):
+    """
+    A condensed deposition transcript prints 2 or 4 mini-pages per sheet
+    inside ruled boxes, which ODL sees as a table and would read ROW by row
+    (13, 15 / 14, 16). Each mini-page starts with its own 'Page N' label, so
+    when every cell of a table starts that way, return the cells sorted by
+    that label (13, 14, 15, 16). Otherwise return None (normal table order).
+    """
+    cells = []
+    for row in table.get("rows") or []:
+        for cell in (row.get("cells") or []) if isinstance(row, dict) else []:
+            cells.append(cell)
+    if len(cells) < 2:
+        return None
+    keyed = []
+    for c in cells:
+        t = _first_text(c)
+        m = _TRANSCRIPT_PAGE_LABEL_RE.match(t or "")
+        if not m:
+            return None
+        keyed.append((int(m.group(1)), c))
+    keyed.sort(key=lambda x: x[0])
+    return [c for _, c in keyed]
+
+
+def _odl_json_pages(tree: dict, true_page_count: int):
+    """
+    Build per-page plain text from the ODL JSON tree (reading order).
+
+    Why not ODL's own text writer: as of 2.5.x it drops list content nested
+    inside table cells — and a condensed deposition transcript with ruled
+    boxes around each mini-page IS a table of lists, so its text output
+    kept only the 'Page 13' labels. The JSON tree has everything; walking it
+    here gives the same reading order with every element's text.
+    """
+    if not tree:
+        return None
+    items = []
+    _odl_walk(tree.get("kids", []), None, items)
+    pages = [[] for _ in range(true_page_count)]
+    prev_type = [None] * true_page_count
+    for pg, typ, content, _bbox in items:
+        if not isinstance(pg, int) or not (1 <= pg <= true_page_count):
+            continue
+        buf = pages[pg - 1]
+        content = content.rstrip()
+        if buf:
+            # consecutive list items (transcript lines) stay single-spaced
+            if typ == "list item" and prev_type[pg - 1] == "list item":
+                buf.append("\n")
+            else:
+                buf.append("\n\n")
+        buf.append(content)
+        prev_type[pg - 1] = typ
+    return ["".join(b).strip() for b in pages]
+
+
+def extract_pages_odl(pdf_path: Path, true_page_count: int, fmt: str, odl_opts: dict,
+                      _cache: dict = None):
+    """
+    Return a per-page list (index 0 = page 1) of Markdown (fmt='md') or plain
+    text (fmt='txt') from opendataloader-pdf, or None if unavailable/failed.
+    If _cache (a dict) is given, the raw run result is stored under 'odl_run'
+    so stamp detection can reuse the JSON without a second Java launch.
+    """
+    run = run_odl(pdf_path, fmt, odl_opts)
+    if _cache is not None:
+        _cache["odl_run"] = run
+    if run is None:
+        return None
+    if fmt == "md":
+        return _odl_md_pages(run.get("md"), true_page_count)
+    return _odl_json_pages(run.get("json"), true_page_count)
+
+
+# ── Bates / confidentiality stamp capture (from ODL JSON bounding boxes) ─────
+#
+# Production PDFs carry a Bates number and often a confidentiality legend
+# burned into the page margin. They are short, sit in the top or bottom
+# margin zone, and repeat with a changing number — exactly what repeating-
+# header/footer stripping removes from the body. So we capture them from the
+# ODL element tree (which has a bounding box for every element) and write
+# them into each page's marker line instead.
+
+STAMP_ZONE_PT = 100.0   # element must lie within this many points of the top or bottom edge
+STAMP_MAX_CHARS = 90    # stamps are short
+
+_BATES_RE = re.compile(
+    r"(?<![A-Za-z0-9])"                       # not glued to other text
+    r"([A-Z][A-Z0-9]{1,14}(?:[-_. ][A-Z0-9]{1,14}){0,3}?)"   # prefix, e.g. ACME, DEF-PROD, ABC_ 
+    r"[-_ ]?0*(\d{4,9})"                      # 4+ digit sequence (allow leading zeros)
+    r"(?![A-Za-z0-9])"
+)
+# Legends are stamped in CAPS (or Title Case); spoken/body text ("marked
+# confidential") is lower case and must not match, so no re.I here.
+_CONF_RE = re.compile(
+    r"\b((?:HIGHLY|Highly)\s+(?:CONFIDENTIAL|Confidential)(?:\s*[-–—]\s*(?:ATTORNEYS?|Attorneys?)['’]?\s+(?:EYES|Eyes)\s+(?:ONLY|Only))?"
+    r"|(?:CONFIDENTIAL|Confidential)(?:\s*[-–—]\s*(?:(?:ATTORNEYS?|Attorneys?)['’]?\s+(?:EYES|Eyes)\s+(?:ONLY|Only)"
+    r"|(?:SUBJECT|Subject)\s+(?:TO|to)\s+(?:PROTECTIVE|Protective)\s+(?:ORDER|Order)))?"
+    r"|(?:ATTORNEYS?|Attorneys?)['’]?\s+(?:EYES|Eyes)\s+(?:ONLY|Only)"
+    r"|(?:OUTSIDE|Outside)\s+(?:COUNSEL|Counsel)(?:['’][Ss])?\s+(?:EYES|Eyes)\s+(?:ONLY|Only)"
+    r"|PROTECTED(?:\s+HEALTH\s+INFORMATION)?|PRIVILEGED(?:\s+(?:AND|&)\s+CONFIDENTIAL)?"
+    r"|AEO|RESTRICTED)\b"
+)
+STAMP_MAX_REMAINDER = 25   # chars left in the element after removing the stamp(s) and page tokens
+_PAGE_TOKEN_RE = re.compile(r"\b(?:Page|PAGE|p\.)\s*\d+(?:\s*(?:of|OF|/)\s*\d+)?\b|\b\d{1,4}\b|[-–—|·•]")
+_BATES_BLACKLIST = {"PAGE", "EXHIBIT", "EX", "NO", "CASE", "CAUSE", "DOC", "DOCUMENT", "ECF", "NYSCEF", "DKT", "ID", "PDF"}
+# A number introduced by one of these is a docket/cause/case/invoice number,
+# not a Bates stamp (e.g. "NO. DC-00-00000", "Case 4:23-cv-01234").
+_BATES_CONTEXT_BLOCK_RE = re.compile(
+    r"(?:\bNO\.?|\bNUMBER|\bCAUSE|\bCASE|\bCIVIL\s+ACTION|\bDOCKET|\bDKT\.?|\bINDEX|\bINVOICE|\bACCT\.?|\bACCOUNT|#)\s*$",
+    re.I,
+)
+
+
+def _page_heights_pymupdf(pdf_path: Path, n: int):
+    try:
+        import fitz
+        doc = fitz.open(str(_win_path(pdf_path)))
+        hs = [doc[i].rect.height for i in range(min(n, doc.page_count))]
+        doc.close()
+        return hs
+    except Exception:
+        return [792.0] * n
+
+
+def detect_stamps_from_odl(tree: dict, true_page_count: int, pdf_path: Path = None) -> dict:
+    """
+    Returns {page: {"bates": "ABC_000123" | None, "conf": "CONFIDENTIAL" | None}}
+    for pages where at least one stamp was found in the top/bottom margin zone.
+    ODL bounding boxes are [left, bottom, right, top] in PDF points, origin
+    bottom-left.
+    """
+    stamps = {}
+    if not tree:
+        return stamps
+    items = []
+    _odl_walk(tree.get("kids", []), None, items)
+    heights = _page_heights_pymupdf(pdf_path, true_page_count) if pdf_path else [792.0] * true_page_count
+    for pg, typ, content, bbox in items:
+        if not isinstance(pg, int) or not (1 <= pg <= true_page_count):
+            continue
+        text = " ".join(content.split())
+        if not text or len(text) > STAMP_MAX_CHARS:
+            continue
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+        h = heights[pg - 1] if pg - 1 < len(heights) else 792.0
+        bottom, top = bbox[1], bbox[3]
+        in_zone = (bottom <= STAMP_ZONE_PT) or (top >= h - STAMP_ZONE_PT)
+        if not in_zone:
+            continue
+        bates = conf = None
+        remainder = text
+        for m in _BATES_RE.finditer(text):
+            prefix = m.group(1)
+            if prefix.upper().rstrip("-_. ") in _BATES_BLACKLIST:
+                continue
+            if re.fullmatch(r"\d{1,2}", prefix):
+                continue
+            if _BATES_CONTEXT_BLOCK_RE.search(text[:m.start()]):
+                continue
+            bates = m.group(0).strip()
+            remainder = remainder.replace(m.group(0), " ", 1)
+            break
+        m = _CONF_RE.search(text)
+        if m:
+            conf = " ".join(m.group(1).upper().split())
+            remainder = remainder.replace(m.group(0), " ", 1)
+        if bates is None and conf is None:
+            continue
+        # A stamp element is (almost) nothing but the stamp(s) and a page
+        # token. Anything with real sentence text around it is body text.
+        remainder = _PAGE_TOKEN_RE.sub(" ", remainder)
+        if len("".join(remainder.split())) > STAMP_MAX_REMAINDER:
+            continue
+        entry = stamps.setdefault(pg, {"bates": None, "conf": None})
+        if bates and entry["bates"] is None:
+            entry["bates"] = bates
+        if conf and entry["conf"] is None:
+            entry["conf"] = conf
+    return stamps
+
+
+def stamp_suffix(entry: dict) -> str:
+    parts = []
+    if entry.get("bates"):
+        parts.append(f"Bates {entry['bates']}")
+    if entry.get("conf"):
+        parts.append(entry["conf"])
+    return " | ".join(parts)
+
+
+_MARKER_MD_RE = re.compile(r"<!-- Page (\d+) of (\d+) -->")
+_MARKER_TXT_RE = re.compile(r"=== PAGE (\d+) of (\d+) ===")
+
+
+def apply_stamps_to_body(body: str, stamps: dict) -> str:
+    """Append ' | Bates X | CONFIDENTIAL' to each page marker that has a stamp."""
+    if not stamps:
+        return body
+
+    def _md(m):
+        e = stamps.get(int(m.group(1)))
+        return m.group(0) if not e else f"<!-- Page {m.group(1)} of {m.group(2)} | {stamp_suffix(e)} -->"
+
+    def _txt(m):
+        e = stamps.get(int(m.group(1)))
+        return m.group(0) if not e else f"=== PAGE {m.group(1)} of {m.group(2)} | {stamp_suffix(e)} ==="
+
+    body = _MARKER_MD_RE.sub(_md, body)
+    body = _MARKER_TXT_RE.sub(_txt, body)
+    return body
+
+
+def bates_range_line(stamps: dict) -> str:
+    """'BATES RANGE:       ABC_000123 – ABC_000162 (40 of 40 pages stamped)' or ''."""
+    nums = [(pg, e["bates"]) for pg, e in sorted(stamps.items()) if e.get("bates")]
+    if not nums:
+        return ""
+    first, last = nums[0][1], nums[-1][1]
+    return f"{first} – {last} ({len(nums)} pages stamped)" if first != last else f"{first} (1 page stamped)"
+
+
+def confidentiality_summary(stamps: dict) -> str:
+    kinds = Counter(e["conf"] for e in stamps.values() if e.get("conf"))
+    if not kinds:
+        return ""
+    return ", ".join(f"{k} ({n} pg)" for k, n in kinds.most_common())
+
+
+# ── Bash OCR (tesseract) for image-only pages ────────────────────────────────
+#
+# Image-only pages (vendor TIFF-to-PDF productions, scans, signature pages)
+# have no text layer for any extractor to read. Tesseract runs here as a
+# bash subprocess: it costs ZERO Claude tokens — the token-expensive thing
+# is Claude's Read tool rendering PDF pages as images, which this skill
+# never does. Pages are rendered with PyMuPDF at OCR_DPI, tesseract writes
+# txt + tsv (word confidences and boxes), and the result flows into the
+# normal pipeline: page text, CONTENT GAPS (with an OCR-LOW-CONFIDENCE
+# class), page markers, MANIFEST, and Bates/legend stamp capture (from the
+# tesseract word boxes, converted to PDF points).
+
+OCR_DPI = 300
+OCR_MIN_ALNUM = 20          # fewer alnum chars than this after OCR -> still IMAGE-ONLY
+OCR_LOW_CONF = 60.0         # mean word confidence below this -> OCR-LOW-CONFIDENCE gap
+OCR_TIMEOUT_S = 180
+
+
+OCR_BACKEND = None          # "cli" = tesseract executable; "pymupdf" = Tesseract compiled into PyMuPDF
+
+
+def _tessdata_dir():
+    """Folder holding <lang>.traineddata: $TESSDATA_PREFIX first, then tessdata/ beside this script."""
+    for c in (os.environ.get("TESSDATA_PREFIX"), str(Path(__file__).resolve().parent / "tessdata")):
+        if c and any(Path(c).glob("*.traineddata")):
+            return c
+    return None
+
+
+def ocr_available():
+    global OCR_BACKEND
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        return False, "PyMuPDF not installed (needed to render pages for OCR)"
+    if shutil.which("tesseract"):
+        OCR_BACKEND = "cli"
+        return True, ""
+    if _tessdata_dir():
+        OCR_BACKEND = "pymupdf"
+        return True, ""
+    return False, ("no tesseract executable in PATH and no tessdata folder found "
+                   "(set TESSDATA_PREFIX to a folder containing eng.traineddata, "
+                   "ship tessdata/ beside the script, or apt-get install -y tesseract-ocr)")
+
+
+def _ocr_page_pymupdf(pdf_path: Path, page_index: int, lang: str = "eng"):
+    """
+    OCR one page with the Tesseract engine compiled into PyMuPDF. Needs no
+    tesseract executable, so it works on locked-down Windows machines. Same
+    return shape as ocr_page except conf is None (PyMuPDF exposes no word
+    confidences) and line boxes are already in PDF points (scale 1.0).
+    """
+    import fitz
+    try:
+        doc = fitz.open(str(_win_path(pdf_path)))
+        page = doc[page_index]
+        h_pt = page.rect.height
+        tp = page.get_textpage_ocr(flags=0, language=lang, dpi=OCR_DPI, full=True,
+                                   tessdata=_tessdata_dir())
+        text = page.get_text(textpage=tp)
+        words = page.get_text("words", textpage=tp)
+        doc.close()
+    except Exception:
+        return None
+    grouped = {}
+    for x0, y0, x1, y1, w, blk, ln, _ in words:
+        g = grouped.setdefault((blk, ln), {"words": [], "l": x0, "t": y0, "r": x1, "b": y1})
+        g["words"].append(w)
+        g["l"] = min(g["l"], x0)
+        g["t"] = min(g["t"], y0)
+        g["r"] = max(g["r"], x1)
+        g["b"] = max(g["b"], y1)
+    lines = [(" ".join(g["words"]), None, g["l"], g["t"], g["r"] - g["l"], g["b"] - g["t"])
+             for _, g in sorted(grouped.items())]
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return {"text": text, "conf": None, "lines": lines, "page_height_pt": h_pt, "scale": 1.0}
+
+
+def _tsv_lines(tsv_text: str):
+    """Group tesseract TSV words into lines -> [(text, conf_mean, l, t, w, h)] in pixels."""
+    rows = tsv_text.splitlines()
+    if not rows:
+        return []
+    hdr = rows[0].split("\t")
+    idx = {k: i for i, k in enumerate(hdr)}
+    need = ("level", "block_num", "par_num", "line_num", "left", "top", "width", "height", "conf", "text")
+    if any(k not in idx for k in need):
+        return []
+    lines = {}
+    order = []
+    for r in rows[1:]:
+        f = r.split("\t")
+        if len(f) < len(hdr):
+            continue
+        try:
+            if int(f[idx["level"]]) != 5:
+                continue
+            conf = float(f[idx["conf"]])
+        except ValueError:
+            continue
+        word = f[idx["text"]].strip()
+        if not word or conf < 0:
+            continue
+        key = (f[idx["block_num"]], f[idx["par_num"]], f[idx["line_num"]])
+        l, t, w, h = (int(f[idx["left"]]), int(f[idx["top"]]), int(f[idx["width"]]), int(f[idx["height"]]))
+        if key not in lines:
+            lines[key] = {"words": [], "confs": [], "l": l, "t": t, "r": l + w, "b": t + h}
+            order.append(key)
+        L = lines[key]
+        L["words"].append(word)
+        L["confs"].append(conf)
+        L["l"] = min(L["l"], l)
+        L["t"] = min(L["t"], t)
+        L["r"] = max(L["r"], l + w)
+        L["b"] = max(L["b"], t + h)
+    out = []
+    for key in order:
+        L = lines[key]
+        out.append((" ".join(L["words"]), sum(L["confs"]) / len(L["confs"]),
+                    L["l"], L["t"], L["r"] - L["l"], L["b"] - L["t"]))
+    return out
+
+
+def ocr_page(pdf_path: Path, page_index: int, lang: str = "eng"):
+    """
+    OCR one page (0-based) in bash. Returns dict:
+      {"text": str, "conf": float|None, "lines": [(text, conf, l, t, w, h)],
+       "page_height_pt": float, "scale": pt_per_px}
+    or None on failure.
+    """
+    if OCR_BACKEND == "pymupdf":
+        return _ocr_page_pymupdf(pdf_path, page_index, lang)
+    import fitz
+    import tempfile
+    try:
+        doc = fitz.open(str(_win_path(pdf_path)))
+        page = doc[page_index]
+        h_pt = page.rect.height
+        pix = page.get_pixmap(dpi=OCR_DPI)
+        with tempfile.TemporaryDirectory(prefix="cowork_ocr_") as td:
+            png = Path(td) / "page.png"
+            pix.save(str(png))
+            base = Path(td) / "out"
+            r = subprocess.run(
+                ["tesseract", str(png), str(base), "-l", lang, "--psm", "3", "txt", "tsv"],
+                capture_output=True, text=True, timeout=OCR_TIMEOUT_S,
+            )
+            if r.returncode != 0:
+                doc.close()
+                return None
+            text = (base.with_suffix(".txt")).read_text(encoding="utf-8", errors="replace")
+            tsv = (base.with_suffix(".tsv")).read_text(encoding="utf-8", errors="replace")
+        doc.close()
+    except Exception:
+        return None
+    lines = _tsv_lines(tsv)
+    confs = [c for _, c, *_ in lines]
+    conf = (sum(confs) / len(confs)) if confs else None
+    # collapse 3+ blank lines; keep the PDF's own line structure otherwise
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return {"text": text, "conf": conf, "lines": lines,
+            "page_height_pt": h_pt, "scale": 72.0 / OCR_DPI}
+
+
+def ocr_result_to_odl_tree(results: dict) -> dict:
+    """
+    Build a minimal ODL-shaped element tree from tesseract lines so
+    detect_stamps_from_odl can run unchanged on OCR'd pages.
+    results: {page_number(1-based): ocr_page() dict}
+    """
+    kids = []
+    for pg, res in results.items():
+        if not res:
+            continue
+        sc = res["scale"]
+        h = res["page_height_pt"]
+        for text, conf, l, t, w, hh in res["lines"]:
+            left = l * sc
+            right = (l + w) * sc
+            top = h - t * sc
+            bottom = h - (t + hh) * sc
+            kids.append({"type": "paragraph", "page number": pg, "content": text,
+                         "bounding box": [round(left, 2), round(bottom, 2), round(right, 2), round(top, 2)]})
+    return {"kids": kids}
+
+
+def ocr_gap_pages(pdf_path: Path, pages: list, gaps: list, mode: str = "auto",
+                  lang: str = "eng", workers: int = 2, true_page_count: int = 0):
+    """
+    OCR the pages that need it and splice the text into `pages`/`gaps`.
+      mode 'auto'  : IMAGE-ONLY and PARTIAL pages only
+      mode 'force' : every page (for garbage text layers)
+      mode 'off'   : no-op
+    Returns (pages, gaps, ocr_info) where ocr_info = {"pages": [n,...],
+    "low_conf": [n,...], "still_empty": [n,...], "results": {n: ocr dict}}.
+    """
+    info = {"pages": [], "low_conf": [], "still_empty": [], "results": {}}
+    if mode == "off":
+        return pages, gaps, info
+    ok, reason = ocr_available()
+    if not ok:
+        print(f"  OCR skipped: {reason}")
+        return pages, gaps, info
+    n_total = max(len(pages), true_page_count)
+    # make sure the pages list covers the whole document
+    while len(pages) < n_total:
+        pages.append("")
+    gap_by_page = {g["page"]: g for g in gaps}
+    if mode == "force":
+        targets = list(range(1, n_total + 1))
+    else:
+        targets = sorted(pg for pg, g in gap_by_page.items()
+                         if g["type"] in ("IMAGE-ONLY", "PARTIAL", "EXTRACTION FAILED") and pg <= n_total)
+    if not targets:
+        return pages, gaps, info
+
+    _eng = "PyMuPDF built-in tesseract" if OCR_BACKEND == "pymupdf" else "tesseract, bash"
+    print(f"  OCR ({_eng}) on {len(targets)} page(s)...", end=" ", flush=True)
+    from concurrent.futures import ThreadPoolExecutor
+    results = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for pg, res in zip(targets, ex.map(lambda p: ocr_page(pdf_path, p - 1, lang), targets)):
+            results[pg] = res
+    for pg in targets:
+        res = results.get(pg)
+        if not res or _alnum_len(res["text"]) < OCR_MIN_ALNUM:
+            info["still_empty"].append(pg)
+            continue
+        pages[pg - 1] = res["text"]
+        info["pages"].append(pg)
+        info["results"][pg] = res
+        gaps[:] = [g for g in gaps if g["page"] != pg]
+        if res["conf"] is not None and res["conf"] < OCR_LOW_CONF:
+            info["low_conf"].append(pg)
+            gaps.append({"page": pg, "type": "OCR-LOW-CONFIDENCE", "chars": len(res["text"]),
+                         "detail": f"OCR text (mean word confidence {res['conf']:.0f}%) — verify against the image."})
+    gaps.sort(key=lambda g: g["page"])
+    print(f"OK ({len(info['pages'])} pg OCR'd"
+          + (f", {len(info['low_conf'])} low-confidence" if info["low_conf"] else "")
+          + (f", {len(info['still_empty'])} still blank" if info["still_empty"] else "") + ")")
+    return pages, gaps, info
+
+
+
+# ── Working-copy preparation (password / page range) ─────────────────────────
+
+def parse_page_spec(spec: str, max_page: int) -> list:
+    """'1,3,5-7' -> [1, 3, 5, 6, 7], clipped to max_page, de-duplicated, sorted."""
+    pages = set()
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a = int(a) if a.strip() else 1
+            b = int(b) if b.strip() else max_page
+            for p in range(a, b + 1):
+                pages.add(p)
+        else:
+            pages.add(int(part))
+    return sorted(p for p in pages if 1 <= p <= (max_page or 10 ** 9))
+
+
+def prepare_working_pdf(pdf_path: Path, password: str = None, pages_spec: str = None):
+    """
+    Produce the PDF the pipeline actually reads. Handles two cases the
+    extractors cannot on their own:
+      - encrypted PDFs (--password): decrypted once into a temp copy
+      - page ranges (--pages): a temp subset PDF
+    Returns (work_path, page_map, source_total, tmpdir_handle, decrypted).
+    page_map is None when the whole document is converted, else a list mapping
+    output page index (1-based) -> original page number.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(_win_path(pdf_path)))
+    if reader.is_encrypted:
+        rc = 0
+        try:
+            rc = reader.decrypt(password if password is not None else "")
+        except Exception as e:
+            raise RuntimeError(f"PDF is encrypted and could not be opened: {e}")
+        if not rc:
+            if password is None:
+                raise RuntimeError("PDF is password-protected — rerun with --password <pw>.")
+            raise RuntimeError("Incorrect password for encrypted PDF.")
+    source_total = len(reader.pages)
+
+    page_map = None
+    if pages_spec:
+        page_map = parse_page_spec(pages_spec, source_total)
+        if not page_map:
+            raise RuntimeError(f"--pages '{pages_spec}' selects no pages (PDF has {source_total}).")
+        if len(page_map) == source_total:
+            page_map = None  # whole document after all
+
+    if not reader.is_encrypted and page_map is None:
+        return pdf_path, None, source_total, None, False
+
+    import tempfile
+    tmpdir = tempfile.TemporaryDirectory(prefix="cowork_work_")
+    writer = PdfWriter()
+    for p in (page_map or range(1, source_total + 1)):
+        writer.add_page(reader.pages[p - 1])
+    work_path = Path(tmpdir.name) / pdf_path.name
+    with open(work_path, "wb") as fh:
+        writer.write(fh)
+    return work_path, page_map, source_total, tmpdir, bool(reader.is_encrypted)
+
+
+_RELABEL_PATTERNS = [
+    (re.compile(r"<!-- Page (\d+) of (\d+)( \| [^>]*?)? -->"), "<!-- Page {p} of {t}{x} -->"),
+    (re.compile(r"=== PAGE (\d+) of (\d+)( \| .*?)? ==="), "=== PAGE {p} of {t}{x} ==="),
+    (re.compile(r"CONTENT GAP — PAGE (\d+)"), "CONTENT GAP — PAGE {p}"),
+    (re.compile(r"^(PAGE +)(\d+):", re.M), None),
+    (re.compile(r"Review original PDF page (\d+)"), "Review original PDF page {p}"),
+]
+
+
+def relabel_pages(text: str, page_map: list, source_total: int) -> str:
+    """Rewrite subset page numbers (1..k) in an output file to original page numbers."""
+    if not page_map:
+        return text
+
+    def orig(n: int) -> int:
+        return page_map[n - 1] if 1 <= n <= len(page_map) else n
+
+    for rx, fmt in _RELABEL_PATTERNS:
+        if fmt is None:
+            text = rx.sub(lambda m: f"{m.group(1)}{orig(int(m.group(2)))}:", text)
+        elif "{t}" in fmt:
+            text = rx.sub(lambda m: fmt.format(p=orig(int(m.group(1))), t=source_total,
+                                               x=(m.group(3) or "")), text)
+        else:
+            text = rx.sub(lambda m: fmt.format(p=orig(int(m.group(1)))), text)
+    return text
+
+
+def compact_page_spec(page_map: list) -> str:
+    """[5,6,7,10] -> '5-7,10'"""
+    if not page_map:
+        return ""
+    out = []
+    start = prev = page_map[0]
+    for p in page_map[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        out.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = p
+    out.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(out)
+
+
+def _strip_hf_from_md(md_pages, hf_data):
+    """
+    Strip detected repeating header/footer lines from pymupdf4llm output,
+    reusing the legacy hf detection (fuzzy page-number matching). Table rows
+    (lines starting with '|') are never stripped.
+    """
+    if not hf_data or not (hf_data.get("header_texts") or hf_data.get("footer_texts")):
+        return md_pages
+    out = []
+    for page in md_pages:
+        kept = []
+        for line in page.splitlines():
+            probe = line.strip().lstrip("#").strip().strip("*_").strip()
+            if probe and not line.lstrip().startswith("|") and _is_header_footer(probe, hf_data):
+                continue
+            kept.append(line)
+        out.append("\n".join(kept))
+    return out
+
+
+def _strip_hf_from_raw(raw: str, hf_data) -> str:
+    """Drop detected repeating header/footer lines from a raw-text page."""
+    if not raw or not hf_data or not (hf_data.get("header_texts") or hf_data.get("footer_texts")):
+        return raw
+    kept = [l for l in raw.splitlines() if not (l.strip() and _is_header_footer(l.strip(), hf_data))]
+    return "\n".join(kept).strip()
+
+
+def build_page_text_md4llm(md_pages, raw_pages, gaps, hf_data=None) -> str:
+    """
+    Body for .md output from a structured engine (opendataloader-pdf or
+    pymupdf4llm). Preserves the CONTENT GAP flag contract and
+    <!-- Page N of M --> markers; any page where the engine returned nothing
+    falls back to that page's raw extracted text (headers/footers stripped).
+    """
+    total = len(raw_pages)
+    gap_pages = {g["page"]: g for g in gaps}
+    sections = []
+    for i in range(1, total + 1):
+        header = f"<!-- Page {i} of {total} -->"
+        raw = raw_pages[i - 1] if i <= len(raw_pages) else ""
+        raw = _strip_hf_from_raw(raw, hf_data)
+        md = md_pages[i - 1] if i <= len(md_pages) else ""
+        if i in gap_pages:
+            gap = gap_pages[i]
+            if gap["type"] == "IMAGE-ONLY":
+                body = (f"[CONTENT GAP — PAGE {i}: No extractable text — image/scan/signature page]\n"
+                        f"[→ Review original PDF for this page]")
+            elif gap["type"] == "PARTIAL":
+                content = md if _alnum_len(md) >= _alnum_len(raw) else raw
+                body = (f"[CONTENT GAP — PAGE {i}: Partial extraction ({gap['chars']} chars). "
+                        f"Content below may be incomplete]\n"
+                        f"[→ Review original PDF for full content]\n\n{content}")
+            elif gap["type"] == "OCR-LOW-CONFIDENCE":
+                body = (f"[CONTENT GAP — PAGE {i}: {gap['detail']}]\n"
+                        f"[→ Verify against original PDF image]\n\n{raw}")
+            else:
+                body = (f"[CONTENT GAP — PAGE {i}: Extraction failed]\n"
+                        f"[→ Review original PDF for this page]")
+        elif md.strip():
+            body = md
+        else:
+            body = raw
+        sections.append(f"{header}\n\n{body}")
+    grand_total = max([total] + [g["page"] for g in gaps])
+    for gap in gaps:
+        if gap["page"] > total:
+            header = f"<!-- Page {gap['page']} of {grand_total} -->"
+            body = (f"[CONTENT GAP — PAGE {gap['page']}: Page exists in PDF but extraction failed]\n"
+                    f"[→ Review original PDF for this page]")
+            sections.append(f"{header}\n\n{body}")
+    return "\n\n".join(sections)
+
+
 def extract_with_pdftotext(pdf_path: Path) -> tuple[list[str], list[dict]]:
     """Returns (list of page texts, list of gap dicts)."""
     # pdftotext.exe (poppler) does not understand the \\?\ extended-length
@@ -1145,13 +2135,18 @@ def extract_with_pdftotext(pdf_path: Path) -> tuple[list[str], list[dict]]:
 
     raw = result.stdout
     raw_pages = raw.split("\x0c")
+    # pdftotext terminates EVERY page with \f, so the split leaves one extra
+    # empty piece at the end — drop that artifact only. Leading empty pages
+    # are real (image-only scans) and must be kept and flagged; skipping
+    # them used to make an all-image production report "0 pages /
+    # EXTRACTION FAILED" instead of N IMAGE-ONLY pages.
+    if raw_pages and not raw_pages[-1].strip():
+        raw_pages.pop()
     pages = []
     gaps = []
 
     for raw_page in raw_pages:
         stripped = raw_page.strip()
-        if not stripped and not pages:
-            continue
         page_num = len(pages) + 1
         if not stripped:
             gaps.append({
@@ -1172,12 +2167,8 @@ def extract_with_pdftotext(pdf_path: Path) -> tuple[list[str], list[dict]]:
         else:
             pages.append(stripped)
 
-    # Remove trailing empty pages
-    while pages and not pages[-1]:
-        removed_page = len(pages)
-        pages.pop()
-        gaps = [g for g in gaps if g["page"] != removed_page]
-
+    # Trailing empty pages are real pages (image-only) and stay flagged;
+    # only the split artifact was removed above.
     return pages, gaps
 
 
@@ -1324,7 +2315,9 @@ def build_content_gaps_block(validation: dict, output_format: str = "txt") -> st
     return "\n".join(lines)
 
 
-def build_file_header(pdf_path: Path, method: str, validation: dict, output_format: str) -> str:
+def build_file_header(pdf_path: Path, method: str, validation: dict, output_format: str,
+                      engine: str = None, extra_lines: list = None,
+                      source_total: int = None) -> str:
     """Build the full header: file info + content gaps + notes."""
     total = max(validation["true_page_count"], validation["extracted_count"])
     format_label = "Markdown (.md)" if output_format == "md" else "Plain text (.txt)"
@@ -1334,7 +2327,11 @@ def build_file_header(pdf_path: Path, method: str, validation: dict, output_form
         f"SOURCE:            {pdf_path}",
         f"EXTRACTION METHOD: {method}",
         f"OUTPUT FORMAT:     {format_label}",
-        f"TOTAL PAGES:       {total}",
+        f"TOTAL PAGES:       {source_total if source_total else total}",
+    ]
+    for l in (extra_lines or []):
+        lines.append(l)
+    lines += [
         f"CONVERTED:         {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         SEPARATOR,
         "",
@@ -1343,9 +2340,27 @@ def build_file_header(pdf_path: Path, method: str, validation: dict, output_form
         SEPARATOR,
     ]
 
-    if output_format == "md":
+    if output_format == "md" and engine == "odl":
+        lines.append("NOTE: Structure (headings, lists, tables, ~~strikethrough~~) from opendataloader-pdf")
+        lines.append("      (XY-Cut++ reading order, local Java mode, no OCR). Off-page/hidden text")
+        lines.append("      filtered; repeating headers/footers stripped. Inline bold/italic NOT marked.")
+        lines.append("      Bates numbers / confidentiality legends, when found, are written into each")
+        lines.append("      page marker: <!-- Page N of M | Bates X | CONFIDENTIAL -->.")
+        lines.append("      Image-only pages are OCR'd with tesseract (see OCR PAGES); [OCR-LOW-CONFIDENCE]")
+        lines.append("      gaps carry text that should be checked against the image.")
+        lines.append("      [CONTENT GAP] markers indicate pages requiring original PDF review.")
+    elif output_format == "md":
         lines.append("NOTE: Headings, bold, and italic are inferred from PDF font metadata.")
         lines.append("      Caption blocks are rendered as blockquotes (> ).")
+        lines.append("      [CONTENT GAP] markers indicate pages requiring original PDF review.")
+    elif engine == "odl":
+        lines.append("NOTE: Text in reading order from opendataloader-pdf (XY-Cut++): multi-column")
+        lines.append("      condensed transcripts are linearized column by column, original line")
+        lines.append("      breaks and running headers/footers kept. All content is verbatim.")
+        lines.append("      Bates numbers / confidentiality legends, when found, are written into each")
+        lines.append("      page marker: === PAGE N of M | Bates X | CONFIDENTIAL ===.")
+        lines.append("      Image-only pages are OCR'd with tesseract (see OCR PAGES); [OCR-LOW-CONFIDENCE]")
+        lines.append("      gaps carry text that should be checked against the image.")
         lines.append("      [CONTENT GAP] markers indicate pages requiring original PDF review.")
     else:
         lines.append("NOTE: Two-column legal transcripts preserve side-by-side layout.")
@@ -1371,15 +2386,18 @@ def build_page_text_txt(pages: list[str], gaps: list[dict]) -> str:
                 body = f"[CONTENT GAP — PAGE {i}: No extractable text — image/scan/signature page]\n[→ Review original PDF for this page]"
             elif gap["type"] == "PARTIAL":
                 body = f"[CONTENT GAP — PAGE {i}: Partial extraction ({gap['chars']} chars). Content below may be incomplete]\n[→ Review original PDF for full content]\n\n{text}"
+            elif gap["type"] == "OCR-LOW-CONFIDENCE":
+                body = f"[CONTENT GAP — PAGE {i}: {gap['detail']}]\n[→ Verify against original PDF image]\n\n{text}"
             else:
                 body = f"[CONTENT GAP — PAGE {i}: Extraction failed]\n[→ Review original PDF for this page]"
         else:
             body = text
         sections.append(f"{header}\n\n{body}")
 
+    grand_total = max([total] + [g["page"] for g in gaps])
     for gap in gaps:
         if gap["page"] > total:
-            header = f"{SEPARATOR}\n=== PAGE {gap['page']} of {gap['page']} ===\n{SEPARATOR}"
+            header = f"{SEPARATOR}\n=== PAGE {gap['page']} of {grand_total} ===\n{SEPARATOR}"
             body = f"[CONTENT GAP — PAGE {gap['page']}: Page exists in PDF but extraction failed]\n[→ Review original PDF for this page]"
             sections.append(f"{header}\n\n{body}")
 
@@ -1408,6 +2426,8 @@ def build_page_text_md(pages: list[str], gaps: list[dict], meta: dict, hf_data: 
                 body = f"[CONTENT GAP — PAGE {i}: No extractable text — image/scan/signature page]\n[→ Review original PDF for this page]"
             elif gap["type"] == "PARTIAL":
                 body = f"[CONTENT GAP — PAGE {i}: Partial extraction ({gap['chars']} chars). Content below may be incomplete]\n[→ Review original PDF for full content]\n\n{text}"
+            elif gap["type"] == "OCR-LOW-CONFIDENCE":
+                body = f"[CONTENT GAP — PAGE {i}: {gap['detail']}]\n[→ Verify against original PDF image]\n\n{text}"
             else:
                 body = f"[CONTENT GAP — PAGE {i}: Extraction failed]\n[→ Review original PDF for this page]"
             sections.append(f"{header}\n\n{body}")
@@ -1426,9 +2446,10 @@ def build_page_text_md(pages: list[str], gaps: list[dict], meta: dict, hf_data: 
             # No metadata for this page, use raw text
             sections.append(f"{header}\n\n{text}")
 
+    grand_total = max([total] + [g["page"] for g in gaps])
     for gap in gaps:
         if gap["page"] > total:
-            header = f"<!-- Page {gap['page']} of {gap['page']} -->"
+            header = f"<!-- Page {gap['page']} of {grand_total} -->"
             body = f"[CONTENT GAP — PAGE {gap['page']}: Page exists in PDF but extraction failed]\n[→ Review original PDF for this page]"
             sections.append(f"{header}\n\n{body}")
 
@@ -1437,7 +2458,8 @@ def build_page_text_md(pages: list[str], gaps: list[dict], meta: dict, hf_data: 
 
 # ── Manifest ─────────────────────────────────────────────────────────────────
 
-def update_manifest(manifest_path: Path, pdf_name: str, method: str, validation: dict, output_format: str):
+def update_manifest(manifest_path: Path, pdf_name: str, method: str, validation: dict, output_format: str,
+                    ocr_pages=None):
     """Append or update an entry in the _cowork_txt/MANIFEST.md file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     total = max(validation["true_page_count"], validation["extracted_count"])
@@ -1458,6 +2480,8 @@ def update_manifest(manifest_path: Path, pdf_name: str, method: str, validation:
     else:
         entry_lines.append("- Gaps: None")
 
+    if ocr_pages:
+        entry_lines.append(f"- OCR: {len(ocr_pages)} page(s) via tesseract ({compact_page_spec(sorted(ocr_pages))})")
     entry_lines.append(f"- Completeness: {validation['completeness_pct']}%")
     entry_lines.append("")
 
@@ -1465,17 +2489,15 @@ def update_manifest(manifest_path: Path, pdf_name: str, method: str, validation:
 
     if manifest_path.exists():
         existing = manifest_path.read_text(encoding="utf-8")
-        marker = f"## {pdf_name}"
-        if marker in existing:
-            parts = existing.split(marker)
-            before = parts[0]
-            after_rest = marker.join(parts[1:])
-            next_heading = after_rest.find("\n## ", 1)
-            if next_heading == -1:
-                after = ""
-            else:
-                after = after_rest[next_heading:]
-            new_content = before + entry_block + after
+        # Match the heading as a whole line so "## X.pdf" never swallows
+        # "## X.pdf [pages 2-3]" (or vice versa).
+        m = re.search(rf"^## {re.escape(pdf_name)}[ \t]*$", existing, re.M)
+        if m:
+            before = existing[:m.start()]
+            after_rest = existing[m.end():]
+            nm = re.search(r"^## ", after_rest, re.M)
+            after = after_rest[nm.start():] if nm else ""
+            new_content = before + entry_block + ("\n" if after else "") + after
         else:
             new_content = existing.rstrip() + "\n\n" + entry_block
     else:
@@ -1509,6 +2531,11 @@ def convert_pdf(
     force_method: str = None,
     cowork_subfolder: bool = True,
     requested_format: str = "auto",
+    md_engine: str = "odl",
+    txt_engine: str = "odl",
+    password: str = None,
+    pages_spec: str = None,
+    odl_opts: dict = None,
 ) -> tuple[Path, dict]:
     """
     Convert a single PDF to .md or .txt with full validation.
@@ -1517,32 +2544,56 @@ def convert_pdf(
     if not _win_path(pdf_path).exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
+    # Working copy: decrypt (--password) and/or subset (--pages) once, so every
+    # extractor downstream reads a plain, complete-for-its-purpose PDF.
+    src_path = pdf_path
+    work_path, page_map, source_total, _tmp, decrypted = prepare_working_pdf(pdf_path, password, pages_spec)
+    if work_path is not pdf_path:
+        what = []
+        if decrypted:
+            what.append("decrypted")
+        if page_map:
+            what.append(f"pages {compact_page_spec(page_map)} of {source_total}")
+        print(f"  Working copy: {', '.join(what) or 'prepared'}")
+    pdf_path = work_path
+
     # Determine format
     output_format = determine_format(pdf_path, requested_format)
     suffix = f"_COWORK.{output_format}"
+    if page_map:
+        suffix = f"_p{compact_page_spec(page_map).replace(',', '_')}{suffix}"
 
-    # Determine output location
+    # Determine output location (always relative to the ORIGINAL file)
     if output_path:
         out_path = output_path
     elif cowork_subfolder:
-        subfolder = pdf_path.parent / "_cowork_txt"
+        subfolder = src_path.parent / "_cowork_txt"
         subfolder.mkdir(exist_ok=True)
-        out_path = subfolder / f"{pdf_path.stem}{suffix}"
+        out_path = subfolder / f"{src_path.stem}{suffix}"
     else:
-        out_path = pdf_path.with_name(f"{pdf_path.stem}{suffix}")
+        out_path = src_path.with_name(f"{src_path.stem}{suffix}")
 
-    # Get true page count
+    extra_header = []
+    if page_map:
+        extra_header.append(f"PAGE RANGE:        {compact_page_spec(page_map)} (of {source_total} in source PDF)")
+
+    def _finish(full_text: str) -> str:
+        return relabel_pages(full_text, page_map, source_total) if page_map else full_text
+
+    # Get true page count (of the working copy)
     true_page_count = get_pdf_page_count(pdf_path)
     print(f"  PDF page count: {true_page_count}")
     print(f"  Output format: .{output_format}")
 
     # Prefer a DISCO native-text sidecar when present: it is letter-perfect
     # (extracted from the native file, not OCR of a scanned image).
-    sidecar_path, sidecar_txt = find_native_txt_sidecar(pdf_path)
+    # (Sidecars are looked up next to the ORIGINAL file, whole-document only.)
+    sidecar_path, sidecar_txt = (None, None) if page_map else find_native_txt_sidecar(src_path)
     if sidecar_txt is not None:
+        pdf_path = src_path
         print(f"  Using DISCO native text sidecar: {sidecar_path.name}")
-        validation = _build_native_validation(true_page_count)
-        header = build_native_header(pdf_path, sidecar_path, true_page_count, output_format)
+        validation = _build_native_validation(source_total or true_page_count)
+        header = build_native_header(pdf_path, sidecar_path, source_total or true_page_count, output_format)
         full_text = header + sidecar_txt.strip() + "\n"
         _win_path(out_path.parent).mkdir(parents=True, exist_ok=True)
         _win_path(out_path).write_text(full_text, encoding="utf-8")
@@ -1565,7 +2616,11 @@ def convert_pdf(
             if hf_count:
                 print(f"  Detected {hf_count} repeating header/footer patterns to strip")
         else:
-            print("SKIP (pymupdf not available, falling back to plain text in .md)")
+            try:
+                import fitz  # noqa: F401
+                print("SKIP (no text layer found — image-only PDF?)")
+            except ImportError:
+                print("SKIP (pymupdf not available, falling back to plain text in .md)")
 
     # Try extraction methods
     order = [force_method] if force_method else DEFAULT_ORDER
@@ -1595,19 +2650,110 @@ def convert_pdf(
                     _dbl += 1
             if _dbl:
                 print(f"[text-layer dedup: {_dbl} pg]", end=" ", flush=True)
+            print()
+
+            # Bash OCR for image-only / partial pages (zero Claude tokens).
+            _oo = odl_opts or {}
+            pages, gaps, ocr_info = ocr_gap_pages(
+                pdf_path, pages, gaps, mode=_oo.get("ocr", "auto"),
+                lang=_oo.get("ocr_lang", "eng"), workers=int(_oo.get("ocr_workers", 2) or 2),
+                true_page_count=true_page_count)
+            ocr_pages = set(ocr_info["pages"])
+            if ocr_pages:
+                _via = " via PyMuPDF, no confidence scores" if OCR_BACKEND == "pymupdf" else ""
+                method_name = f"{method_name} + tesseract OCR ({len(ocr_pages)} pg{_via})"
 
             # Validate
             validation = validate_extraction(pages, gaps, true_page_count)
 
-            # Build output
-            header = build_file_header(pdf_path, method_name, validation, output_format)
-
-            if output_format == "md" and meta:
-                body = build_page_text_md(pages, validation["gaps"], meta, hf_data)
+            # Build output (body first so the structured engine can annotate
+            # method_name). Engine chains:
+            #   .md : opendataloader-pdf -> pymupdf4llm -> legacy font renderer -> plain
+            #   .txt: opendataloader-pdf -> pdftotext -layout
+            engine_used = None
+            odl_cache = {}
+            if output_format == "md":
+                body = None
+                if md_engine == "odl":
+                    print("  Trying opendataloader-pdf Markdown engine...", end=" ", flush=True)
+                    odl_pages = extract_pages_odl(pdf_path, true_page_count, "md", odl_opts, odl_cache)
+                    if md_engine_quality_ok(odl_pages, pages, "opendataloader-pdf", ocr_pages):
+                        odl_pages = _strip_hf_from_md(odl_pages, hf_data)
+                        body = build_page_text_md4llm(odl_pages, pages, validation["gaps"], hf_data)
+                        method_name = f"{method_name} + opendataloader-pdf {odl_version() or ''}".rstrip()
+                        engine_used = "odl"
+                        print("OK")
+                    else:
+                        print("FALLBACK -> pymupdf4llm")
+                if body is None and md_engine != "legacy":
+                    print("  Trying pymupdf4llm Markdown engine...", end=" ", flush=True)
+                    md_pages = extract_md_pages_pymupdf4llm(pdf_path, true_page_count)
+                    if md_engine_quality_ok(md_pages, pages, "pymupdf4llm", ocr_pages):
+                        md_pages = _strip_hf_from_md(md_pages, hf_data)
+                        body = build_page_text_md4llm(md_pages, pages, validation["gaps"], hf_data)
+                        method_name = f"{method_name} + pymupdf4llm"
+                        engine_used = "pymupdf4llm"
+                        print("OK")
+                    else:
+                        print("FALLBACK -> legacy font-metadata renderer")
+                if body is None and meta:
+                    body = build_page_text_md(pages, validation["gaps"], meta, hf_data)
+                    engine_used = "legacy"
+                if body is None:
+                    body = build_page_text_txt(pages, validation["gaps"])
             else:
-                body = build_page_text_txt(pages, validation["gaps"])
+                body = None
+                if txt_engine == "odl":
+                    print("  Trying opendataloader-pdf text engine...", end=" ", flush=True)
+                    odl_pages = extract_pages_odl(pdf_path, true_page_count, "txt", odl_opts, odl_cache)
+                    if md_engine_quality_ok(odl_pages, pages, "opendataloader-pdf", ocr_pages):
+                        merged = [(o if o.strip() else r) for o, r in zip(odl_pages, pages)]
+                        body = build_page_text_txt(merged, validation["gaps"])
+                        method_name = f"{method_name} + opendataloader-pdf {odl_version() or ''}".rstrip()
+                        engine_used = "odl"
+                        print("OK")
+                    else:
+                        print("FALLBACK -> pdftotext -layout")
+                if body is None:
+                    body = build_page_text_txt(pages, validation["gaps"])
 
-            full_text = header + body
+            # Bates / confidentiality stamps from the ODL element tree (bounding
+            # boxes). Reuses the JSON from the engine run; if ODL was not the
+            # engine, one JSON-only run is made when the engine is available.
+            stamps = {}
+            if not (odl_opts or {}).get("no_stamps"):
+                run = odl_cache.get("odl_run")
+                if run is None and "odl_run" not in odl_cache and odl_available()[0]:
+                    print("  Reading element tree for stamps...", end=" ", flush=True)
+                    run = run_odl(pdf_path, "txt", odl_opts)
+                    print("OK" if run else "")
+                if run and run.get("json"):
+                    stamps = detect_stamps_from_odl(run["json"], true_page_count, pdf_path)
+                if ocr_info["results"]:
+                    ocr_stamps = detect_stamps_from_odl(ocr_result_to_odl_tree(ocr_info["results"]),
+                                                        true_page_count, None)
+                    for pg, e in ocr_stamps.items():
+                        stamps.setdefault(pg, e)
+                if stamps:
+                    body = apply_stamps_to_body(body, stamps)
+                    br = bates_range_line(stamps)
+                    cs = confidentiality_summary(stamps)
+                    if br:
+                        extra_header.append(f"BATES RANGE:       {br}")
+                    if cs:
+                        extra_header.append(f"CONFIDENTIALITY:   {cs}")
+                    print(f"  Stamps captured on {len(stamps)} page(s)"
+                          + (f" — Bates {br}" if br else "") + (f" — {cs}" if cs else ""))
+
+            if ocr_pages:
+                extra_header.append(f"OCR PAGES:         {compact_page_spec(sorted(ocr_pages))}"
+                                    f" ({'PyMuPDF built-in tesseract, no word confidences' if OCR_BACKEND == 'pymupdf' else 'tesseract'},"
+                                    f" {OCR_DPI} dpi; text is OCR, not native)")
+            header = build_file_header(src_path, method_name, validation, output_format,
+                                       engine=engine_used, extra_lines=extra_header,
+                                       source_total=source_total)
+
+            full_text = _finish(header + body)
 
             # Write output (use \\?\ prefix on Windows to bypass 260-char MAX_PATH)
             _win_path(out_path.parent).mkdir(parents=True, exist_ok=True)
@@ -1623,9 +2769,11 @@ def convert_pdf(
 
             print(f"  SAVED: {out_path}")
 
-            # Update manifest
+            # Update manifest (page-range runs get their own entry)
             manifest_path = out_path.parent / "MANIFEST.md"
-            update_manifest(manifest_path, pdf_path.name, method_name, validation, output_format)
+            manifest_key = src_path.name + (f" [pages {compact_page_spec(page_map)}]" if page_map else "")
+            update_manifest(manifest_path, manifest_key, method_name, validation, output_format,
+                            ocr_pages=ocr_pages)
 
             return out_path, validation
 
@@ -1642,6 +2790,10 @@ def convert_directory(
     skip_existing: bool = False,
     cowork_subfolder: bool = True,
     requested_format: str = "auto",
+    md_engine: str = "odl",
+    txt_engine: str = "odl",
+    password: str = None,
+    odl_opts: dict = None,
 ) -> dict:
     """Batch-convert all PDFs in a directory."""
     pdfs = sorted(dir_path.glob("*.pdf"))
@@ -1674,6 +2826,10 @@ def convert_directory(
                 force_method=force_method,
                 cowork_subfolder=cowork_subfolder,
                 requested_format=requested_format,
+                md_engine=md_engine,
+                txt_engine=txt_engine,
+                password=password,
+                odl_opts=odl_opts,
             )
             successes.append({
                 "name": pdf.name,
@@ -1759,10 +2915,85 @@ def main():
         help="Path to write a JSON report (for Cowork skill integration)",
         default=None,
     )
+    parser.add_argument(
+        "--md-engine",
+        choices=["odl", "pymupdf4llm", "legacy"],
+        default=os.environ.get("COWORK_MD_ENGINE", "odl"),
+        help="Structured engine for .md output. Chain: odl (opendataloader-pdf, "
+             "default) -> pymupdf4llm -> legacy font-metadata renderer. Each "
+             "engine is quality-gated against the pdftotext reference and falls "
+             "through automatically. Env override: COWORK_MD_ENGINE.",
+    )
+    parser.add_argument(
+        "--txt-engine",
+        choices=["odl", "pdftotext"],
+        default=os.environ.get("COWORK_TXT_ENGINE", "odl"),
+        help="Engine for .txt output. odl (default): opendataloader-pdf reading "
+             "order, line breaks and headers/footers kept; pdftotext: the "
+             "side-by-side -layout rendering. Env override: COWORK_TXT_ENGINE.",
+    )
+    parser.add_argument(
+        "--password", "-p",
+        default=None,
+        help="Password for an encrypted PDF (decrypted once into a temp working copy)",
+    )
+    parser.add_argument(
+        "--pages",
+        default=None,
+        help="Convert only these pages, e.g. '1,3,5-7' (single-file mode). Output "
+             "is named <stem>_p<range>_COWORK.* and page markers keep the "
+             "ORIGINAL page numbers.",
+    )
+    odl = parser.add_argument_group(
+        "opendataloader-pdf options",
+        "Pass-throughs to the local Java engine. The hybrid/AI backend (OCR, VLM) "
+        "is deliberately not exposed — see the skill's No-OCR rule.",
+    )
+    odl.add_argument("--use-struct-tree", action="store_true",
+                     help="Use the PDF's own structure tags (tagged PDFs) for reading order "
+                          "and headings. Off by default: quality depends on the producer's tags.")
+    odl.add_argument("--table-method", choices=["default", "cluster"], default=None,
+                     help="Table detection: default (ruled borders) or cluster (borders + "
+                          "whitespace clustering, catches borderless tables)")
+    odl.add_argument("--sanitize", action="store_true",
+                     help="Replace emails, phone numbers, IPs, credit-card numbers and URLs "
+                          "with placeholders in the output (NOT verbatim — opt in only)")
+    odl.add_argument("--content-safety-off", default=None, metavar="LIST",
+                     help="Disable content-safety filters: all, hidden-text, off-page, tiny, "
+                          "hidden-ocg, background (comma-separated). Default: all filters ON.")
+    odl.add_argument("--threads", type=int, default=1,
+                     help="Worker threads for per-page processing (default 1; >1 experimental)")
+    odl.add_argument("--no-stamps", action="store_true",
+                     help="Do not capture Bates numbers / confidentiality legends into page markers")
+    ocr = parser.add_argument_group(
+        "OCR (tesseract in bash — zero Claude tokens)",
+        "Image-only and near-empty pages are OCR'd automatically. Text is marked as OCR in the "
+        "header, MANIFEST and (when confidence is low) the CONTENT GAPS block.",
+    )
+    ocr.add_argument("--ocr", choices=["auto", "off", "force"], default=os.environ.get("COWORK_OCR", "auto"),
+                     help="auto (default): OCR IMAGE-ONLY/PARTIAL pages; off: never; force: OCR every page "
+                          "(replaces a garbage text layer). Env override: COWORK_OCR.")
+    ocr.add_argument("--ocr-lang", default="eng", help="tesseract language(s), e.g. eng or eng+spa (default eng)")
+    ocr.add_argument("--ocr-workers", type=int, default=2,
+                     help="Parallel tesseract processes (default 2)")
 
     args = parser.parse_args()
     target = Path(args.input)
     use_subfolder = not args.no_subfolder
+    odl_opts = {
+        "use_struct_tree": args.use_struct_tree,
+        "table_method": args.table_method,
+        "sanitize": args.sanitize,
+        "content_safety_off": args.content_safety_off,
+        "threads": args.threads,
+        "no_stamps": args.no_stamps,
+        "ocr": args.ocr,
+        "ocr_lang": args.ocr_lang,
+        "ocr_workers": args.ocr_workers,
+    }
+    if args.pages and target.is_dir():
+        print("Error: --pages applies to single-file mode only.", file=sys.stderr)
+        sys.exit(2)
 
     if target.is_dir():
         results = convert_directory(
@@ -1771,6 +3002,10 @@ def main():
             skip_existing=args.skip_existing,
             cowork_subfolder=use_subfolder,
             requested_format=args.format,
+            md_engine=args.md_engine,
+            txt_engine=args.txt_engine,
+            password=args.password,
+            odl_opts=odl_opts,
         )
         if args.json_report:
             write_json_report(Path(args.json_report), results)
@@ -1781,6 +3016,11 @@ def main():
             force_method=args.method,
             cowork_subfolder=use_subfolder,
             requested_format=args.format,
+            md_engine=args.md_engine,
+            txt_engine=args.txt_engine,
+            password=args.password,
+            pages_spec=args.pages,
+            odl_opts=odl_opts,
         )
         if args.json_report:
             write_json_report(Path(args.json_report), {
